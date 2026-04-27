@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+
+{% block title %}Haymarket Transcripts{% endblock %}
+
+{% block content %}
+<section class="transcript-shell">
+  <aside class="control-panel">
+    <section class="panel-section">
+      <h2>Transcripts</h2>
+      <label for="transcript-search">Search sources</label>
+      <input id="transcript-search" type="search" placeholder="Bonfield, exhibit, page...">
+      <div id="transcript-count" class="muted">Loading transcripts...</div>
+      <div id="transcript-list" class="transcript-list"></div>
+    </section>
+
+    <section class="panel-section">
+      <h2>Highlights</h2>
+      <label for="mention-kind-filter">Entity type</label>
+      <select id="mention-kind-filter">
+        <option value="">All mentions</option>
+        <option value="person">People</option>
+        <option value="location">Places</option>
+        <option value="claim">Claims</option>
+        <option value="event">Events</option>
+      </select>
+      <div id="mention-summary" class="muted">Select a transcript.</div>
+    </section>
+  </aside>
+
+  <section class="transcript-panel">
+    <header class="transcript-header">
+      <div>
+        <h2 id="transcript-title">Transcript Review</h2>
+        <p id="transcript-meta" class="meta">Select a source to inspect TEI-derived text and extraction anchors.</p>
+      </div>
+      <a id="tei-link" class="button-link" href="#" target="_blank" rel="noreferrer" hidden>View TEI XML</a>
+    </header>
+    <article id="transcript-body" class="transcript-body">
+      <p class="muted">No transcript selected.</p>
+    </article>
+  </section>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/common/api.js') }}"></script>
+<script src="{{ url_for('static', filename='js/pages/transcripts.js') }}"></script>
+{% endblock %}

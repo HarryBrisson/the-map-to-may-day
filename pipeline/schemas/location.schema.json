@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://the-map-to-may-day.local/schemas/location.schema.json",
+  "title": "Location",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "name",
+    "address_1886",
+    "address_1887",
+    "modern_address",
+    "coordinates",
+    "location_type",
+    "source_ids",
+    "notes"
+  ],
+  "properties": {
+    "id": { "type": "string", "pattern": "^location_" },
+    "name": { "type": "string", "minLength": 1 },
+    "address_1886": { "type": ["string", "null"] },
+    "address_1887": { "type": ["string", "null"] },
+    "modern_address": { "type": ["string", "null"] },
+    "coordinates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lat", "lng", "confidence", "method"],
+      "properties": {
+        "lat": { "type": ["number", "null"] },
+        "lng": { "type": ["number", "null"] },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "method": { "type": "string" },
+        "provider": { "type": "string" },
+        "place_id": { "type": ["string", "null"] },
+        "raw_response_id": { "type": ["string", "null"] }
+      }
+    },
+    "location_type": { "type": "string" },
+    "source_ids": { "type": "array", "items": { "type": "string" } },
+    "notes": { "type": ["string", "null"] },
+    "geocoding": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "status": { "type": "string" },
+        "query": { "type": ["string", "null"] },
+        "formatted_address": { "type": ["string", "null"] },
+        "location_type": { "type": ["string", "null"] },
+        "llm_call_id": { "type": ["string", "null"] },
+        "google_response_id": { "type": ["string", "null"] },
+        "error": { "type": ["string", "null"] }
+      }
+    }
+  },
+  "examples": [
+    {
+      "id": "location_desplaines_station",
+      "name": "Desplaines Street Station",
+      "address_1886": "Desplaines Street Station, Chicago",
+      "address_1887": null,
+      "modern_address": null,
+      "coordinates": {
+        "lat": null,
+        "lng": null,
+        "confidence": 0.2,
+        "method": "unresolved_historic_reference"
+      },
+      "location_type": "police_station",
+      "source_ids": ["source_hadc_i019_052"],
+      "notes": "Mentioned as the rendezvous point for police companies on May 4, 1886."
+    }
+  ]
+}

@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://the-map-to-may-day.local/schemas/source_page.schema.json",
+  "title": "Source Page",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "url",
+    "title",
+    "source_type",
+    "fetched_at",
+    "raw_html_sha256",
+    "candidate_text_sha256",
+    "raw_html_path",
+    "candidate_text_path",
+    "tei_path",
+    "transcript_json_path",
+    "text",
+    "links",
+    "page_images",
+    "page_cues",
+    "toc_entries",
+    "transcript_metadata",
+    "source_stats"
+  ],
+  "properties": {
+    "id": { "type": "string", "pattern": "^source_" },
+    "url": { "type": "string" },
+    "title": { "type": "string" },
+    "source_type": { "enum": ["toc", "testimony", "exhibit", "transcript"] },
+    "fetched_at": { "type": "string" },
+    "raw_html_sha256": { "type": "string" },
+    "candidate_text_sha256": { "type": "string" },
+    "raw_html_path": { "type": "string" },
+    "candidate_text_path": { "type": "string" },
+    "tei_path": { "type": "string" },
+    "transcript_json_path": { "type": "string" },
+    "text": { "type": "string" },
+    "links": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["text", "url"],
+        "properties": {
+          "text": { "type": "string" },
+          "url": { "type": "string" }
+        }
+      }
+    },
+    "page_images": { "type": "array", "items": { "type": "string" } },
+    "page_cues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["index", "line_index", "label", "page_ref", "facs"],
+        "properties": {
+          "index": { "type": "integer" },
+          "line_index": { "type": "integer" },
+          "label": { "type": "string" },
+          "page_ref": { "type": ["string", "null"] },
+          "facs": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "toc_entries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["index", "label", "url", "source_id"],
+        "properties": {
+          "index": { "type": "integer" },
+          "label": { "type": "string" },
+          "url": { "type": "string" },
+          "source_id": { "type": "string" }
+        }
+      }
+    },
+    "transcript_metadata": { "type": "object" },
+    "source_stats": { "type": "object" }
+  }
+}

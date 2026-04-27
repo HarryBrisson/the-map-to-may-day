@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://the-map-to-may-day.local/schemas/extraction_bundle.schema.json",
+  "title": "Page Extraction Bundle",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["source_id", "tei_xml", "people", "locations", "claims", "event_suggestions", "quotes"],
+  "properties": {
+    "source_id": { "type": "string" },
+    "tei_xml": { "type": "string" },
+    "people": {
+      "type": "array",
+      "items": { "$ref": "person.schema.json" }
+    },
+    "locations": {
+      "type": "array",
+      "items": { "$ref": "location.schema.json" }
+    },
+    "claims": {
+      "type": "array",
+      "items": { "$ref": "claim.schema.json" }
+    },
+    "event_suggestions": {
+      "type": "array",
+      "items": { "$ref": "event.schema.json" }
+    },
+    "quotes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "source_id", "speaker_person_id", "speaker_label", "quote", "page_refs", "confidence"],
+        "properties": {
+          "id": { "type": "string" },
+          "source_id": { "type": "string" },
+          "speaker_person_id": { "type": ["string", "null"] },
+          "speaker_label": { "type": ["string", "null"] },
+          "quote": { "type": "string" },
+          "page_refs": { "type": "array", "items": { "type": "string" } },
+          "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "source_id": "source_hadc_i019_052",
+      "tei_xml": "<TEI />",
+      "people": [],
+      "locations": [],
+      "claims": [],
+      "event_suggestions": [],
+      "quotes": []
+    }
+  ]
+}

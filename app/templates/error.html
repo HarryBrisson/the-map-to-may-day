@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+
+{% block title %}{{ status_code }} | Haymarket Map{% endblock %}
+
+{% block content %}
+<section class="error-card">
+  <h2>{{ status_code }}</h2>
+  <p>{{ message }}</p>
+  <a href="{{ url_for('index') }}">Return to the map</a>
+</section>
+{% endblock %}

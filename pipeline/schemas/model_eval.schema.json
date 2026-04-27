@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://the-map-to-may-day.local/schemas/model_eval.schema.json",
+  "title": "Model Evaluation Summary",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["run_id", "generated_at", "models"],
+  "properties": {
+    "run_id": { "type": "string" },
+    "generated_at": { "type": "string" },
+    "models": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "model",
+          "pages",
+          "parse_success_rate",
+          "schema_error_count",
+          "people_count",
+          "location_count",
+          "claim_count",
+          "event_suggestion_count",
+          "missing_required_fields",
+          "cost_usd"
+        ],
+        "properties": {
+          "model": { "type": "string" },
+          "pages": { "type": "integer", "minimum": 0 },
+          "parse_success_rate": { "type": "number", "minimum": 0, "maximum": 1 },
+          "schema_error_count": { "type": "integer", "minimum": 0 },
+          "people_count": { "type": "integer", "minimum": 0 },
+          "location_count": { "type": "integer", "minimum": 0 },
+          "claim_count": { "type": "integer", "minimum": 0 },
+          "event_suggestion_count": { "type": "integer", "minimum": 0 },
+          "missing_required_fields": { "type": "array", "items": { "type": "string" } },
+          "cost_usd": { "type": "number", "minimum": 0 }
+        }
+      }
+    }
+  }
+}

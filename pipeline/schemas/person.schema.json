@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://the-map-to-may-day.local/schemas/person.schema.json",
+  "title": "Person",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "display_name", "alternate_names", "roles", "bio", "source_ids", "confidence"],
+  "properties": {
+    "id": { "type": "string", "pattern": "^person_" },
+    "display_name": { "type": "string", "minLength": 1 },
+    "alternate_names": { "type": "array", "items": { "type": "string" } },
+    "roles": { "type": "array", "items": { "type": "string" } },
+    "bio": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["birth_year", "death_year", "occupation", "summary"],
+      "properties": {
+        "birth_year": { "type": ["integer", "null"] },
+        "death_year": { "type": ["integer", "null"] },
+        "occupation": { "type": ["string", "null"] },
+        "summary": { "type": ["string", "null"] }
+      }
+    },
+    "source_ids": { "type": "array", "items": { "type": "string" } },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+  },
+  "examples": [
+    {
+      "id": "person_john_bonfield",
+      "display_name": "John Bonfield",
+      "alternate_names": ["Inspector Bonfield"],
+      "roles": ["witness", "police", "inspector"],
+      "bio": {
+        "birth_year": 1836,
+        "death_year": 1898,
+        "occupation": "Inspector of Police, Chicago Police Department",
+        "summary": "Police inspector who testified for the prosecution about the police movement toward the Haymarket meeting."
+      },
+      "source_ids": ["source_hadc_i019_052"],
+      "confidence": 0.95
+    }
+  ]
+}

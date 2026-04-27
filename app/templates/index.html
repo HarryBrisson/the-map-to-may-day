@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+
+{% block title %}Haymarket Trial Map{% endblock %}
+
+{% block content %}
+<section class="map-shell">
+  <aside class="control-panel">
+    <section class="panel-section">
+      <h2>Filters</h2>
+      <label for="person-filter">Person</label>
+      <select id="person-filter">
+        <option value="">All people</option>
+      </select>
+
+      <div class="date-grid">
+        <label>
+          Start
+          <input id="start-date" type="date">
+        </label>
+        <label>
+          End
+          <input id="end-date" type="date">
+        </label>
+      </div>
+
+      <label for="confidence-filter">Minimum confidence</label>
+      <input id="confidence-filter" type="range" min="0" max="1" step="0.05" value="0">
+      <output id="confidence-output">0.00</output>
+    </section>
+
+    <section class="panel-section">
+      <h2>Events</h2>
+      <div id="event-count" class="muted">Loading events...</div>
+      <div id="event-list" class="event-list"></div>
+    </section>
+  </aside>
+
+  <section class="map-panel">
+    <div id="map" class="map"></div>
+    <div id="details-panel" class="details-panel">
+      <h2>Details</h2>
+      <p class="muted">Select an event to see claims, source links, and participants.</p>
+    </div>
+  </section>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/common/api.js') }}"></script>
+<script src="{{ url_for('static', filename='js/pages/map.js') }}"></script>
+{% endblock %}

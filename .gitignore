@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+creds.json
+app/creds.json
+pipeline/creds.json
+data/
+.venv/
+venv/

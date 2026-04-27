@@ -1,0 +1,19 @@
+{
+  "prod": {
+    "app_function": "app.app",
+    "aws_region": "us-east-1",
+    "project_name": "haymarket-map",
+    "runtime": "python3.12",
+    "s3_bucket": "haymarket-map-prod",
+    "keep_warm": true,
+    "keep_warm_expression": "rate(5 minutes)",
+    "keep_warm_path": "/health",
+    "exclude": [
+      "boto3",
+      "botocore",
+      "dateutil",
+      "s3transfer",
+      "concurrent"
+    ]
+  }
+}

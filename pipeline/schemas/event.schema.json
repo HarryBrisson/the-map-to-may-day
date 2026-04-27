@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://the-map-to-may-day.local/schemas/event.schema.json",
+  "title": "Event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "title",
+    "description",
+    "event_type",
+    "time",
+    "location_id",
+    "participant_person_ids",
+    "claim_ids",
+    "disputed_fields",
+    "confidence"
+  ],
+  "properties": {
+    "id": { "type": "string", "pattern": "^event_" },
+    "title": { "type": "string" },
+    "description": { "type": "string" },
+    "event_type": { "type": "string" },
+    "time": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start", "end", "precision", "display"],
+      "properties": {
+        "start": { "type": ["string", "null"] },
+        "end": { "type": ["string", "null"] },
+        "precision": { "type": "string" },
+        "display": { "type": ["string", "null"] }
+      }
+    },
+    "location_id": { "type": ["string", "null"] },
+    "participant_person_ids": { "type": "array", "items": { "type": "string" } },
+    "claim_ids": { "type": "array", "items": { "type": "string" } },
+    "disputed_fields": { "type": "array", "items": { "type": "string" } },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+  },
+  "examples": [
+    {
+      "id": "event_police_rendezvous_desplaines_station",
+      "title": "Police rendezvous at Desplaines Street Station",
+      "description": "Police companies assembled at Desplaines Street Station before marching toward the Haymarket meeting.",
+      "event_type": "assembly",
+      "time": {
+        "start": "1886-05-04T18:00:00",
+        "end": "1886-05-04T22:30:00",
+        "precision": "range_from_claims",
+        "display": "Evening of May 4, 1886"
+      },
+      "location_id": "location_desplaines_station",
+      "participant_person_ids": ["person_john_bonfield", "person_william_ward"],
+      "claim_ids": ["claim_bonfield_station_1886_05_04_1800"],
+      "disputed_fields": [],
+      "confidence": 0.82
+    }
+  ]
+}

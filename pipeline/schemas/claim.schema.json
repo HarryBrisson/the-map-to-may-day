@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://the-map-to-may-day.local/schemas/claim.schema.json",
+  "title": "Claim",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "claim_type",
+    "source_id",
+    "reported_by_person_id",
+    "claim_made_at",
+    "subject_person_ids",
+    "location_id",
+    "event_time",
+    "statement",
+    "quote",
+    "page_refs",
+    "confidence"
+  ],
+  "properties": {
+    "id": { "type": "string", "pattern": "^claim_" },
+    "claim_type": { "type": "string" },
+    "source_id": { "type": "string" },
+    "reported_by_person_id": { "type": ["string", "null"] },
+    "claim_made_at": { "type": ["string", "null"] },
+    "subject_person_ids": { "type": "array", "items": { "type": "string" } },
+    "location_id": { "type": ["string", "null"] },
+    "event_time": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start", "end", "precision", "original_text"],
+      "properties": {
+        "start": { "type": ["string", "null"] },
+        "end": { "type": ["string", "null"] },
+        "precision": { "type": "string" },
+        "original_text": { "type": ["string", "null"] }
+      }
+    },
+    "statement": { "type": "string" },
+    "quote": { "type": ["string", "null"] },
+    "page_refs": { "type": "array", "items": { "type": "string" } },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+  },
+  "examples": [
+    {
+      "id": "claim_bonfield_station_1886_05_04_1800",
+      "claim_type": "presence_or_movement",
+      "source_id": "source_hadc_i019_052",
+      "reported_by_person_id": "person_john_bonfield",
+      "claim_made_at": "1886-07-16",
+      "subject_person_ids": ["person_john_bonfield", "person_william_ward"],
+      "location_id": "location_desplaines_station",
+      "event_time": {
+        "start": "1886-05-04T18:00:00",
+        "end": null,
+        "precision": "approximate",
+        "original_text": "in the vicinity of six o'clock"
+      },
+      "statement": "Bonfield said he arrived at Desplaines Street Station around six o'clock and that Captain Ward and several lieutenants were present.",
+      "quote": "I think I got to the Desplaines Street Station in the vicinity of six o'clock...",
+      "page_refs": ["Volume I, page 19"],
+      "confidence": 0.88
+    }
+  ]
+}

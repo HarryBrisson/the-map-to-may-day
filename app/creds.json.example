@@ -1,0 +1,7 @@
+{
+  "FLASK_SECRET_KEY": "replace-me",
+  "HAYMARKET_STORAGE_BACKEND": "local",
+  "HAYMARKET_DATA_DIR": "../data",
+  "HAYMARKET_S3_BUCKET": "",
+  "HAYMARKET_S3_PREFIX": ""
+}

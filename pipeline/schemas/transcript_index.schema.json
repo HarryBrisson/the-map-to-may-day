@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://the-map-to-may-day.local/schemas/transcript_index.schema.json",
+  "title": "Transcript Index",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "source_id",
+    "url",
+    "title",
+    "source_type",
+    "fetched_at",
+    "text",
+    "page_refs",
+    "segments",
+    "mentions",
+    "transcript_metadata",
+    "source_stats"
+  ],
+  "properties": {
+    "source_id": { "type": "string", "pattern": "^source_" },
+    "url": { "type": "string" },
+    "title": { "type": "string" },
+    "source_type": { "enum": ["toc", "testimony", "exhibit", "transcript"] },
+    "fetched_at": { "type": "string" },
+    "text": { "type": "string" },
+    "page_refs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["index", "page_ref", "offset", "facs"],
+        "properties": {
+          "index": { "type": "integer" },
+          "page_ref": { "type": ["string", "null"] },
+          "offset": { "type": "integer" },
+          "facs": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "segments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["index", "kind", "page_ref", "line", "start", "end", "text"],
+        "properties": {
+          "index": { "type": "integer" },
+          "kind": { "type": "string" },
+          "page_ref": { "type": ["string", "null"] },
+          "line": { "type": ["integer", "null"] },
+          "start": { "type": "integer" },
+          "end": { "type": "integer" },
+          "text": { "type": "string" }
+        }
+      }
+    },
+    "mentions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "kind", "entity_id", "start", "end", "text", "confidence", "source"],
+        "properties": {
+          "id": { "type": ["string", "null"] },
+          "kind": { "type": ["string", "null"] },
+          "entity_id": { "type": ["string", "null"] },
+          "start": { "type": "integer" },
+          "end": { "type": "integer" },
+          "text": { "type": "string" },
+          "confidence": { "type": ["number", "null"] },
+          "source": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "transcript_metadata": { "type": "object" },
+    "source_stats": { "type": "object" }
+  }
+}
