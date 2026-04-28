@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://the-map-to-may-day.local/schemas/segment_tags.schema.json",
+  "title": "Segment Tags",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["unit_id", "people", "locations", "claims", "events", "quotes"],
+  "properties": {
+    "unit_id": { "type": "string" },
+    "people": { "type": "array", "items": { "$ref": "person.schema.json" } },
+    "locations": { "type": "array", "items": { "$ref": "location.schema.json" } },
+    "claims": { "type": "array", "items": { "$ref": "claim.schema.json" } },
+    "events": { "type": "array", "items": { "$ref": "event.schema.json" } },
+    "quotes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "source_id", "speaker_person_id", "speaker_label", "quote", "page_refs", "confidence"],
+        "properties": {
+          "id": { "type": "string" },
+          "source_id": { "type": "string" },
+          "speaker_person_id": { "type": ["string", "null"] },
+          "speaker_label": { "type": ["string", "null"] },
+          "quote": { "type": "string" },
+          "page_refs": { "type": "array", "items": { "type": "string" } },
+          "confidence": { "type": "number" }
+        }
+      }
+    }
+  }
+}

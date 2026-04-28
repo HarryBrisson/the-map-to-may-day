@@ -16,6 +16,9 @@ def run_enrichment(
     corpus: str,
     llm_provider: str,
     llm_models: list[str],
+    briefing_model: str = "gpt-4.1-mini",
+    max_tagging_workers: int = 8,
+    streaming: bool = True,
 ) -> dict[str, list[dict[str, Any]]]:
     pages = load_pages(storage, run_id)
     extraction = extract_pages_with_audit(
@@ -24,6 +27,9 @@ def run_enrichment(
         run_id=run_id,
         provider=llm_provider,
         models=llm_models,
+        briefing_model=briefing_model,
+        max_tagging_workers=max_tagging_workers,
+        streaming=streaming,
     )
     failed_calls = [record for record in extraction["audit_records"] if record["status"] == "error"]
     successful_calls = [record for record in extraction["audit_records"] if record["status"] == "success"]
@@ -118,6 +124,12 @@ def print_cost_summary(cost_summary: dict[str, Any]) -> None:
     )
     for model, values in cost_summary.get("by_model", {}).items():
         print(f"  {model}: ${values.get('cost_usd', 0):.6f} ({values.get('calls', 0)} calls)")
+    for stage, values in cost_summary.get("by_stage", {}).items():
+        print(
+            f"  stage {stage}: ${values.get('cost_usd', 0):.6f} "
+            f"({values.get('calls', 0)} calls, "
+            f"{values.get('input_tokens', 0)} input + {values.get('output_tokens', 0)} output tokens)"
+        )
 
 
 def print_model_eval(model_eval: dict[str, Any]) -> None:
