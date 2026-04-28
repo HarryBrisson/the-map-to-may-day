@@ -27,6 +27,7 @@ TAGGING_PROMPT_TEMPLATE = "haymarket_segment_tagging_v1"
 TAGGING_MAX_OUTPUT_TOKENS = 1_500
 PRIOR_UNIT_CONTEXT = 3
 DEFAULT_MAX_WORKERS = 8
+DEFAULT_UNIT_ATTEMPTS = 3
 
 
 @dataclass
@@ -43,6 +44,7 @@ class TaggingUnit:
 class _StageState:
     successes: int = 0
     errors: int = 0
+    retried: int = 0
     people: int = 0
     locations: int = 0
     claims: int = 0
@@ -61,6 +63,7 @@ def run_tagging(
     model: str,
     max_workers: int = DEFAULT_MAX_WORKERS,
     progress: StageProgress | None = None,
+    max_unit_attempts: int = DEFAULT_UNIT_ATTEMPTS,
 ) -> dict[str, Any]:
     progress = progress or StageProgress(page["id"], "tagging", enabled=False)
     start = time.monotonic()
@@ -79,13 +82,14 @@ def run_tagging(
     total = len(units)
 
     def submit(unit: TaggingUnit, prior_units: list[TaggingUnit]) -> dict[str, Any]:
-        return tag_one_unit(
+        return tag_one_unit_with_retry(
             page=page,
             briefing=briefing,
             unit=unit,
             prior_units=prior_units,
             model=model,
             schema=schema,
+            max_attempts=max_unit_attempts,
         )
 
     completed = 0
@@ -119,6 +123,8 @@ def run_tagging(
                 usage_total["output_tokens"] += row_usage.get("output_tokens", 0)
                 usage_total["total_tokens"] += row_usage.get("total_tokens", 0)
                 state.cost_usd += float(row.get("cost_usd") or 0.0)
+                if int(row.get("attempts") or 1) > 1:
+                    state.retried += 1
                 if row["status"] == "success":
                     state.successes += 1
                     tags = row.get("tags") or {}
@@ -144,9 +150,10 @@ def run_tagging(
 
     duration = time.monotonic() - start
     cost_rounded = round(state.cost_usd, 8)
+    retry_suffix = f", retried: {state.retried}" if state.retried else ""
     progress.done(
         f"people: {state.people}, locations: {state.locations}, claims: {state.claims}, "
-        f"errors: {state.errors}, ${cost_rounded:.4f}",
+        f"errors: {state.errors}{retry_suffix}, ${cost_rounded:.4f}",
         duration_s=duration,
     )
 
@@ -159,8 +166,61 @@ def run_tagging(
         "unit_count": total,
         "success_count": state.successes,
         "error_count": state.errors,
+        "retried_count": state.retried,
         "duration_s": round(duration, 3),
     }
+
+
+def tag_one_unit_with_retry(
+    page: dict[str, Any],
+    briefing: dict[str, Any] | None,
+    unit: TaggingUnit,
+    prior_units: list[TaggingUnit],
+    model: str,
+    schema: dict[str, Any],
+    max_attempts: int = DEFAULT_UNIT_ATTEMPTS,
+) -> dict[str, Any]:
+    """Run tag_one_unit, retrying up to max_attempts on failure.
+
+    Failed attempts still count toward usage and cost (the API call happened),
+    so we accumulate usage across all attempts and report the final attempt's
+    outcome. attempts and last_error appear in the audit row.
+    """
+    accumulated_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    accumulated_cost = 0.0
+    last_row: dict[str, Any] | None = None
+    attempt_errors: list[str] = []
+    for attempt in range(1, max_attempts + 1):
+        row = tag_one_unit(
+            page=page,
+            briefing=briefing,
+            unit=unit,
+            prior_units=prior_units,
+            model=model,
+            schema=schema,
+        )
+        usage = row.get("usage") or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        accumulated_usage["input_tokens"] += usage.get("input_tokens", 0)
+        accumulated_usage["output_tokens"] += usage.get("output_tokens", 0)
+        accumulated_usage["total_tokens"] += usage.get("total_tokens", 0)
+        accumulated_cost += float(row.get("cost_usd") or 0.0)
+        last_row = row
+        if row["status"] == "success":
+            row["usage"] = accumulated_usage
+            row["cost_usd"] = round(accumulated_cost, 8)
+            row["attempts"] = attempt
+            if attempt_errors:
+                row["prior_errors"] = attempt_errors
+            return row
+        attempt_errors.append(row.get("error") or "unknown")
+
+    # All attempts failed; return last row with retry metadata
+    final = dict(last_row or {})
+    final["usage"] = accumulated_usage
+    final["cost_usd"] = round(accumulated_cost, 8)
+    final["attempts"] = max_attempts
+    final["prior_errors"] = attempt_errors[:-1]  # last error is in row['error'] already
+    return final
 
 
 def tag_one_unit(

@@ -92,6 +92,37 @@ def normalize_openai_schema(schema: Any) -> None:
             normalize_openai_schema(value)
 
 
+def call_openai_text(
+    model: str,
+    input_messages: list[dict[str, str]],
+    max_output_tokens: int | None = None,
+) -> tuple[str, Any, dict[str, int]]:
+    """Plain-text completion. Use when the response is not naturally JSON
+    (e.g. raw TEI XML) — avoids the JSON-string-escape token tax that
+    structured outputs impose."""
+    from openai import OpenAI
+
+    client = OpenAI()
+    request: dict[str, Any] = {
+        "model": model,
+        "input": input_messages,
+    }
+    if max_output_tokens is not None:
+        request["max_output_tokens"] = max_output_tokens
+
+    response = client.responses.create(**request)
+    raw_output = response.model_dump(mode="json")
+    usage_obj = raw_output.get("usage") or {}
+    input_tokens = usage_obj.get("input_tokens") or usage_obj.get("prompt_tokens") or 0
+    output_tokens = usage_obj.get("output_tokens") or usage_obj.get("completion_tokens") or 0
+    usage = {
+        "input_tokens": int(input_tokens),
+        "output_tokens": int(output_tokens),
+        "total_tokens": int(usage_obj.get("total_tokens") or input_tokens + output_tokens),
+    }
+    return response.output_text, raw_output, usage
+
+
 def call_openai_structured(
     model: str,
     input_messages: list[dict[str, str]],
@@ -135,10 +166,29 @@ def call_openai_structured(
 
 
 MODEL_PRICING_PER_1M = {
+    # GPT-4 family (legacy but still used for cheap tasks)
     "gpt-4o-mini": {"input": 0.15, "output": 0.60},
     "gpt-4o": {"input": 2.50, "output": 10.00},
+    "gpt-4.1-nano": {"input": 0.10, "output": 0.40},
     "gpt-4.1-mini": {"input": 0.40, "output": 1.60},
     "gpt-4.1": {"input": 2.00, "output": 8.00},
+    # GPT-5 family
+    "gpt-5-nano": {"input": 0.05, "output": 0.40},
+    "gpt-5-mini": {"input": 0.25, "output": 2.00},
+    "gpt-5": {"input": 1.25, "output": 10.00},
+    "gpt-5-pro": {"input": 15.00, "output": 120.00},
+    "gpt-5.1": {"input": 1.25, "output": 10.00},
+    "gpt-5.2": {"input": 1.75, "output": 14.00},
+    "gpt-5.4-nano": {"input": 0.20, "output": 1.25},
+    "gpt-5.4-mini": {"input": 0.75, "output": 4.50},
+    "gpt-5.4": {"input": 2.50, "output": 15.00},
+    "gpt-5.4-pro": {"input": 30.00, "output": 180.00},
+    "gpt-5.5": {"input": 5.00, "output": 30.00},
+    "gpt-5.5-pro": {"input": 30.00, "output": 180.00},
+    # o-series reasoning models
+    "o3-mini": {"input": 1.10, "output": 4.40},
+    "o4-mini": {"input": 1.10, "output": 4.40},
+    "o3": {"input": 2.00, "output": 8.00},
 }
 
 

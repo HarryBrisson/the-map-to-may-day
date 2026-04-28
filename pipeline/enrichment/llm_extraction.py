@@ -20,8 +20,12 @@ def extract_pages_with_audit(
     provider: str,
     models: list[str],
     briefing_model: str = DEFAULT_BRIEFING_MODEL,
+    tagging_model: str | None = None,
     max_tagging_workers: int = DEFAULT_MAX_WORKERS,
+    max_tagging_unit_attempts: int = 3,
     streaming: bool = True,
+    max_transcription_attempts: int = 2,
+    transcription_format: str = "tei",
 ) -> dict[str, Any]:
     if provider != "openai":
         raise ValueError(f"Unsupported LLM provider: {provider}")
@@ -63,6 +67,8 @@ def extract_pages_with_audit(
                 run_id=run_id,
                 model=model,
                 progress=transcription_progress,
+                max_attempts=max_transcription_attempts,
+                output_format=transcription_format,
             )
 
             tagging: dict[str, Any] | None = None
@@ -75,9 +81,10 @@ def extract_pages_with_audit(
                     tei_xml=transcription["tei_xml"],
                     storage=storage,
                     run_id=run_id,
-                    model=model,
+                    model=tagging_model or model,
                     max_workers=max_tagging_workers,
                     progress=tagging_progress,
+                    max_unit_attempts=max_tagging_unit_attempts,
                 )
                 bundle = tagging["bundle"]
                 bundle["tei_validation"] = transcription.get("validation")

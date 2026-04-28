@@ -50,10 +50,120 @@ def test_briefing_schema_matches_strict_response_format_subset() -> None:
     assert_openai_strict_schema(schema)
 
 
-def test_transcription_schema_matches_strict_response_format_subset() -> None:
-    schema = stage_transcription.transcription_schema()
-    assert_openai_strict_schema(schema)
-    assert set(schema["properties"]) == {"source_id", "tei_xml"}
+def test_extract_tei_from_text_strips_preamble_and_code_fences() -> None:
+    fenced = """Sure, here is the TEI:
+```xml
+<TEI xmlns="http://www.tei-c.org/ns/1.0"><text><body><p>Hi.</p></body></text></TEI>
+```
+"""
+    extracted = stage_transcription.extract_tei_from_text(fenced)
+    assert extracted.startswith("<TEI")
+    assert extracted.endswith("</TEI>")
+    assert "```" not in extracted
+
+
+def test_parse_tei_xml_escapes_stray_ampersands() -> None:
+    from sources.hadc_source import parse_tei_xml
+
+    # &c. (et cetera) appears verbatim in 19th-century trial transcripts;
+    # it would otherwise crash ET.fromstring with "not well-formed (invalid token)"
+    tei = '<TEI xmlns="http://www.tei-c.org/ns/1.0"><text><body><p>back to work, &c., and their ends would be defeated</p></body></text></TEI>'
+    root = parse_tei_xml(tei)
+    p_text = root.find(".//{http://www.tei-c.org/ns/1.0}p").text
+    assert "&c." in p_text
+
+
+def test_extract_tei_from_text_handles_truncated_output() -> None:
+    truncated = '<TEI xmlns="http://www.tei-c.org/ns/1.0"><text><body><p>Half a docu'
+    extracted = stage_transcription.extract_tei_from_text(truncated)
+    assert extracted.startswith("<TEI")
+
+
+def test_parse_jsonl_rows_skips_garbage_and_keeps_valid_objects() -> None:
+    raw = """
+    Sure, here are the rows:
+    ```jsonl
+    {"page":"17","speaker":"Q","speaker_id":"#mr_grinnell","text":"What is your name?"}
+    not a json line
+    {"page":"17","speaker":"A","speaker_id":"#bonfield","text":"John Bonfield."}
+    {"page":"18","speaker":null,"speaker_id":null,"text":"Whereupon a recess..."}
+    ```
+    """
+    rows = stage_transcription.parse_jsonl_rows(raw)
+    assert len(rows) == 3
+    assert rows[0]["text"] == "What is your name?"
+    assert rows[2]["speaker"] is None
+
+
+def test_tag_one_unit_with_retry_recovers_from_first_failure(monkeypatch) -> None:
+    from enrichment.stage_tagging import TaggingUnit, tag_one_unit_with_retry
+
+    calls = {"count": 0}
+
+    def fake_call_openai_structured(model, input_messages, schema, schema_name, max_output_tokens=None):
+        del model, input_messages, schema, schema_name, max_output_tokens
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise stage_tagging.LLMCallError(
+                "transient",
+                raw_output={"error": "rate limit"},
+                usage={"input_tokens": 100, "output_tokens": 0, "total_tokens": 100},
+            )
+        return (
+            {"unit_id": "sp_001", "people": [], "locations": [], "claims": [], "events": [], "quotes": []},
+            {},
+            {"input_tokens": 100, "output_tokens": 50, "total_tokens": 150},
+        )
+
+    monkeypatch.setattr(stage_tagging, "call_openai_structured", fake_call_openai_structured)
+
+    unit = TaggingUnit(
+        unit_id="sp_001",
+        kind="sp",
+        speaker_id="bonfield",
+        page_ref="17",
+        text="John Bonfield.",
+        tei_snippet="<sp/>",
+    )
+    result = tag_one_unit_with_retry(
+        page={"id": "test_page"},
+        briefing=None,
+        unit=unit,
+        prior_units=[],
+        model="gpt-4.1-mini",
+        schema={},
+        max_attempts=3,
+    )
+
+    assert result["status"] == "success"
+    assert result["attempts"] == 2
+    # Usage accumulates across both attempts (100+100 input)
+    assert result["usage"]["input_tokens"] == 200
+    assert "prior_errors" in result and len(result["prior_errors"]) == 1
+
+
+def test_synthesize_tei_from_rows_produces_well_formed_tei() -> None:
+    page = {
+        "id": "source_hadc_i019_052",
+        "page_cues": [{"page_ref": "17", "facs": "https://example/page17.htm"}],
+    }
+    rows = [
+        {"page": "17", "speaker": "Q", "speaker_id": "#mr_grinnell", "text": "What is your name?"},
+        {"page": "17", "speaker": "A", "speaker_id": "#bonfield", "text": "John Bonfield."},
+        {"page": "18", "speaker": None, "speaker_id": None, "text": "Whereupon a recess was taken."},
+    ]
+    tei = stage_transcription.synthesize_tei_from_rows(page, rows)
+    # Round-trip parses cleanly and contains the expected structure
+    from sources.hadc_source import parse_tei_xml, tei_tag
+
+    root = parse_tei_xml(tei)
+    sps = root.findall(f".//{tei_tag('sp')}")
+    assert len(sps) == 2
+    assert sps[0].attrib.get("who") == "#mr_grinnell"
+    assert sps[1].attrib.get("who") == "#bonfield"
+    pbs = root.findall(f".//{tei_tag('pb')}")
+    assert [pb.attrib.get("n") for pb in pbs] == ["17", "18"]
+    assert pbs[0].attrib.get("facs") == "https://example/page17.htm"
 
 
 def test_clear_generated_data_removes_haymarket_artifacts(tmp_path) -> None:
@@ -301,19 +411,21 @@ def test_run_enrichment_writes_app_ready_outputs(tmp_path, monkeypatch) -> None:
     }
     usage = {"input_tokens": 100, "output_tokens": 100, "total_tokens": 200}
 
-    def provider_response(model, input_messages, schema, schema_name, max_output_tokens=None):
+    def structured_response(model, input_messages, schema, schema_name, max_output_tokens=None):
         del model, input_messages, schema, max_output_tokens
         if schema_name == "haymarket_page_briefing":
             return briefing, {"output": "structured"}, usage
-        if schema_name == "haymarket_tei_transcription":
-            return {"source_id": source_id, "tei_xml": transcription_tei}, {"output": "structured"}, usage
         if schema_name == "haymarket_segment_tags":
             return tagging_payload, {"output": "structured"}, usage
         raise AssertionError(f"unexpected schema_name: {schema_name}")
 
-    monkeypatch.setattr(stage_briefing, "call_openai_structured", provider_response)
-    monkeypatch.setattr(stage_transcription, "call_openai_structured", provider_response)
-    monkeypatch.setattr(stage_tagging, "call_openai_structured", provider_response)
+    def text_response(model, input_messages, max_output_tokens=None):
+        del model, input_messages, max_output_tokens
+        return transcription_tei, {"output": "text"}, usage
+
+    monkeypatch.setattr(stage_briefing, "call_openai_structured", structured_response)
+    monkeypatch.setattr(stage_transcription, "call_openai_text", text_response)
+    monkeypatch.setattr(stage_tagging, "call_openai_structured", structured_response)
 
     result = run_enrichment(
         storage=storage,

@@ -26,6 +26,32 @@ if load_dotenv:
     load_dotenv(PIPELINE_ROOT / ".env")
 
 
+MODEL_SLATES: dict[str, list[str]] = {
+    # Two cheapest options — fastest iteration on a small page.
+    "small": ["gpt-4.1-mini", "gpt-5-mini"],
+    # Cheap tier — under ~$0.50/1M input. Good baseline for cost/quality.
+    "cheap": ["gpt-4.1-mini", "gpt-5-mini", "gpt-5-nano", "gpt-4.1-nano"],
+    # Mid tier — punchier than cheap, still affordable.
+    "mid": ["gpt-5.4-mini", "gpt-4.1", "gpt-5"],
+    # Flagship tier — highest fidelity, highest cost.
+    "flagship": ["gpt-5.5", "gpt-5.4"],
+    # Compare across tiers — one cheap, one mid, one flagship.
+    "compare": ["gpt-4.1-mini", "gpt-5-mini", "gpt-5.4-mini", "gpt-5.5"],
+    # Everything we have pricing for. Expensive — usually not what you want.
+    "all": [
+        "gpt-4.1-nano",
+        "gpt-4.1-mini",
+        "gpt-4.1",
+        "gpt-5-nano",
+        "gpt-5-mini",
+        "gpt-5",
+        "gpt-5.4-mini",
+        "gpt-5.4",
+        "gpt-5.5",
+    ],
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Haymarket trial corpus pipeline")
     parser.add_argument("--user", default="local@example.com", help="User email for future S3 path compatibility")
@@ -46,7 +72,18 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "One or more OpenAI model names. Defaults: --test runs a comparison slate "
-            "(gpt-4o-mini, gpt-4.1-mini, gpt-4o); --corpus full runs gpt-4o."
+            "(gpt-4o-mini, gpt-4.1-mini, gpt-4o); --corpus full runs gpt-4o. "
+            "Can be combined with --slate to merge a preset list."
+        ),
+    )
+    parser.add_argument(
+        "--slate",
+        choices=sorted(MODEL_SLATES.keys()),
+        default=None,
+        help=(
+            "Run a predefined comparison slate. Sets --llm-model to a curated list of "
+            "models so you can A/B without remembering names. Overrides --llm-model unless "
+            "you also pass --llm-model (then the two are merged, deduped)."
         ),
     )
     parser.add_argument(
@@ -55,15 +92,62 @@ def parse_args() -> argparse.Namespace:
         help="Fixed model used for Stage A briefing (shared across model slate).",
     )
     parser.add_argument(
+        "--tagging-model",
+        default=None,
+        help=(
+            "Optional fixed model for Stage C tagging. If unset, the per-slate --llm-model is "
+            "used. Recommend a cheaper model here (e.g. gpt-5-mini, gpt-4.1-nano) since each "
+            "tagging call is small and structured."
+        ),
+    )
+    parser.add_argument(
         "--max-tagging-workers",
         type=int,
         default=8,
         help="Concurrent OpenAI calls during Stage C per-unit tagging.",
     )
     parser.add_argument(
+        "--tagging-attempts",
+        type=int,
+        default=3,
+        help=(
+            "Max attempts per tagging unit. The first attempt counts; subsequent attempts "
+            "only fire when the prior attempt errored. Default 3."
+        ),
+    )
+    parser.add_argument(
         "--no-streaming",
         action="store_true",
         help="Suppress per-stage progress lines (useful in CI).",
+    )
+    parser.add_argument(
+        "--pages",
+        nargs="+",
+        default=None,
+        help=(
+            "Restrict enrichment to these page IDs (e.g. --pages source_hadc_x0010). "
+            "Supports prefix match — 'x0010' matches 'source_hadc_x0010'. The pull "
+            "phase still fetches the full --corpus, only enrichment is filtered."
+        ),
+    )
+    parser.add_argument(
+        "--transcription-attempts",
+        type=int,
+        default=2,
+        help=(
+            "Max attempts for Stage B transcription per page. The first attempt counts; "
+            "additional attempts only fire on validation failure. Default 2."
+        ),
+    )
+    parser.add_argument(
+        "--transcription-format",
+        choices=["tei", "jsonl"],
+        default="tei",
+        help=(
+            "Stage B output format. 'tei' asks the model for raw TEI XML (default). 'jsonl' asks "
+            "for one JSON object per source line — the pipeline then synthesizes well-formed TEI "
+            "from the rows. JSONL is more robust against XML well-formedness mistakes."
+        ),
     )
     parser.add_argument("--geocode", action="store_true", help="Run geolocation after enrichment")
     parser.add_argument("--geocoder", choices=["google"], default="google")
@@ -86,7 +170,20 @@ def main() -> None:
     args = parse_args()
     if args.test:
         args.corpus = "test"
-    if args.llm_model is None:
+    if args.slate:
+        slate_models = MODEL_SLATES[args.slate]
+        if args.llm_model:
+            # Merge user-provided models with slate, dedupe preserving order
+            seen: set[str] = set()
+            merged: list[str] = []
+            for model in slate_models + list(args.llm_model):
+                if model not in seen:
+                    seen.add(model)
+                    merged.append(model)
+            args.llm_model = merged
+        else:
+            args.llm_model = list(slate_models)
+    elif args.llm_model is None:
         args.llm_model = (
             ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4o"] if args.corpus == "test" else ["gpt-4o"]
         )
@@ -125,8 +222,13 @@ def main() -> None:
                 llm_provider=args.llm_provider,
                 llm_models=args.llm_model,
                 briefing_model=args.briefing_model,
+                tagging_model=args.tagging_model,
                 max_tagging_workers=args.max_tagging_workers,
+                max_tagging_unit_attempts=args.tagging_attempts,
                 streaming=not args.no_streaming,
+                page_filter=args.pages,
+                max_transcription_attempts=args.transcription_attempts,
+                transcription_format=args.transcription_format,
             )
             print(
                 "Enriched "

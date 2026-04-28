@@ -341,10 +341,12 @@ HTML_VOID_TAGS = ("br", "hr", "img", "lb", "pb", "milestone", "link", "meta")
 
 
 def parse_tei_xml(tei_xml: str) -> ET.Element:
-    """Parse possibly-imperfect TEI from an LLM, tolerating two common defects:
+    """Parse possibly-imperfect TEI from an LLM, tolerating common defects:
 
     - HTML-style void tags like <br> emitted instead of <br/>
     - Missing TEI namespace declaration on the root element
+    - Stray ampersands from the source (e.g. ``&c.`` for et cetera) that
+      the model preserved verbatim instead of escaping as ``&amp;``
     """
     normalized = tei_xml
     for tag in HTML_VOID_TAGS:
@@ -367,6 +369,15 @@ def parse_tei_xml(tei_xml: str) -> ET.Element:
             normalized,
             count=1,
         )
+
+    # Escape stray ampersands that are not part of a valid entity reference.
+    # Matches &c., &foo, & alone — but leaves &amp;, &lt;, &gt;, &quot;, &apos;,
+    # and numeric &#…; references intact.
+    normalized = re.sub(
+        r"&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)",
+        "&amp;",
+        normalized,
+    )
 
     return ET.fromstring(normalized)
 
