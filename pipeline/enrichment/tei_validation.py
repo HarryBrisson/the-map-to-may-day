@@ -9,6 +9,7 @@ from sources.hadc_source import TEI_NS, XML_NS, tei_tag, tei_to_transcript_json
 
 
 TEXT_DRIFT_MIN_RATIO = 0.92
+TEXT_TOKEN_RECALL_MIN = 0.95
 
 
 class TEIValidationError(Exception):
@@ -49,16 +50,26 @@ def validate_generated_tei(page: dict[str, Any], tei_xml: str) -> dict[str, Any]
     candidate_norm = normalize_for_text_validation(candidate_text)
     tei_norm = normalize_for_text_validation(tei_text)
     ratio = SequenceMatcher(None, candidate_norm, tei_norm).ratio() if candidate_norm or tei_norm else 1.0
+    candidate_tokens = set(re.findall(r"\w+", candidate_norm))
+    tei_tokens = set(re.findall(r"\w+", tei_norm))
+    if candidate_tokens:
+        token_recall = len(candidate_tokens & tei_tokens) / len(candidate_tokens)
+    else:
+        token_recall = 1.0
     validation["text"] = {
         "candidate_chars": len(candidate_text),
         "tei_chars": len(tei_text),
         "candidate_normalized_chars": len(candidate_norm),
         "tei_normalized_chars": len(tei_norm),
         "similarity_ratio": round(ratio, 4),
+        "token_recall": round(token_recall, 4),
     }
-    if ratio < TEXT_DRIFT_MIN_RATIO:
+    if ratio < TEXT_DRIFT_MIN_RATIO and token_recall < TEXT_TOKEN_RECALL_MIN:
         validation["status"] = "invalid"
-        validation["errors"].append(f"TEI text drift ratio {ratio:.4f} below {TEXT_DRIFT_MIN_RATIO:.2f}")
+        validation["errors"].append(
+            f"TEI text drift ratio {ratio:.4f} below {TEXT_DRIFT_MIN_RATIO:.2f} "
+            f"and token_recall {token_recall:.4f} below {TEXT_TOKEN_RECALL_MIN:.2f}"
+        )
 
     expected_page_refs = {str(cue.get("page_ref")) for cue in page.get("page_cues", []) if cue.get("page_ref")}
     actual_page_refs = {str(ref.get("page_ref")) for ref in transcript.get("page_refs", []) if ref.get("page_ref")}
@@ -98,10 +109,12 @@ def normalize_for_text_validation(text: str) -> str:
 
 def speaker_attribution_stats(root: ET.Element) -> dict[str, int]:
     speech = root.findall(f".//{tei_tag('sp')}")
+    turns_with_who = [turn for turn in speech if turn.attrib.get("who")]
     answer_turns = [turn for turn in speech if turn.attrib.get("type") == "answer"]
     answer_with_who = [turn for turn in answer_turns if turn.attrib.get("who")]
     return {
         "speech_turns": len(speech),
+        "turns_with_who": len(turns_with_who),
         "answer_turns": len(answer_turns),
         "answer_turns_with_who": len(answer_with_who),
     }

@@ -11,6 +11,7 @@ for module_name in list(sys.modules):
 
 from enrichment import llm_extraction  # noqa: E402
 from enrichment import geolocate_locations  # noqa: E402
+from enrichment.stage_tagging import split_tei_into_units  # noqa: E402
 from enrichment.geolocate_locations import geolocate_locations as geolocate_location_records  # noqa: E402
 from enrichment.harmonization import harmonize_bundles  # noqa: E402
 from enrichment.pipeline import merge_events, run_enrichment  # noqa: E402
@@ -161,11 +162,7 @@ def test_run_enrichment_writes_app_ready_outputs(tmp_path, monkeypatch) -> None:
         ],
     )
 
-    def provider_response(model, input_messages):
-        del input_messages
-        parsed = {
-            "source_id": source_id,
-            "tei_xml": """<?xml version='1.0' encoding='utf-8'?>
+    fixture_tei = """<?xml version='1.0' encoding='utf-8'?>
 <TEI xmlns="http://www.tei-c.org/ns/1.0" xml:id="source_hadc_i019_052">
   <teiHeader>
     <fileDesc>
@@ -186,7 +183,11 @@ def test_run_enrichment_writes_app_ready_outputs(tmp_path, monkeypatch) -> None:
       <annotation xml:id="quote_bonfield_station" type="quote" target="#m_person_john_bonfield" resp="#person_john_bonfield" cert="0.9">John Bonfield testified about Desplaines Street Station.</annotation>
     </listAnnotation>
   </standOff>
-</TEI>""",
+</TEI>"""
+
+    fixture_bundle = {
+            "source_id": source_id,
+            "tei_xml": fixture_tei,
             "people": [
                 {
                     "id": "person_john_bonfield",
@@ -273,10 +274,87 @@ def test_run_enrichment_writes_app_ready_outputs(tmp_path, monkeypatch) -> None:
                 }
             ],
         }
-        usage = {"input_tokens": 100, "output_tokens": 100, "total_tokens": 200}
-        return parsed, {"output": "structured"}, usage
 
-    monkeypatch.setattr(llm_extraction, "call_openai_structured", provider_response)
+    usage = {"input_tokens": 100, "output_tokens": 100, "total_tokens": 200}
+
+    def fake_briefing(page, storage, run_id, model="gpt-4.1-mini", progress=None):
+        del storage, progress
+        briefing = {
+            "source_id": page["id"],
+            "summary": "Bonfield testimony fixture.",
+            "witness": {"name": "John Bonfield", "role": "police inspector"},
+            "examiners": [],
+            "defendants_referenced": [],
+            "key_locations": ["Desplaines Street Station"],
+            "key_dates": [],
+            "topics": [],
+            "speaker_directory": [
+                {"speaker_id": "speaker_bonfield", "display_name": "John Bonfield", "role": "witness"}
+            ],
+        }
+        return {
+            "briefing": briefing,
+            "audit": {
+                "run_id": run_id,
+                "stage": "briefing",
+                "page_id": page["id"],
+                "model": model,
+                "raw_output": {"output": "fixture"},
+                "parsed_output": briefing,
+                "usage": usage,
+                "cost_usd": 0.0,
+                "status": "success",
+                "error": None,
+            },
+            "usage": usage,
+            "cost_usd": 0.0,
+            "status": "success",
+            "error": None,
+        }
+
+    def fake_transcription(page, briefing, storage, run_id, model, raw_html="", progress=None):
+        del briefing, storage, raw_html, progress
+        validation = {"status": "valid", "errors": [], "warnings": [], "text": {}}
+        return {
+            "tei_xml": fixture_tei,
+            "validation": validation,
+            "audit": {
+                "run_id": run_id,
+                "stage": "transcription",
+                "page_id": page["id"],
+                "model": model,
+                "raw_output": {"output": "fixture"},
+                "parsed_output": {"tei_xml": fixture_tei, "tei_validation": validation},
+                "validation": validation,
+                "usage": usage,
+                "cost_usd": 0.0,
+                "status": "success",
+                "error": None,
+                "input_diagnostics": {},
+            },
+            "usage": usage,
+            "cost_usd": 0.0,
+            "status": "success",
+            "error": None,
+            "chunks": [],
+        }
+
+    def fake_tagging(page, briefing, tei_xml, storage, run_id, model, max_workers=8, progress=None):
+        del briefing, storage, run_id, model, max_workers, progress
+        bundle = dict(fixture_bundle)
+        bundle["tei_xml"] = tei_xml
+        return {
+            "bundle": bundle,
+            "audit_records": [],
+            "usage": usage,
+            "cost_usd": 0.0,
+            "unit_count": 1,
+            "status": "success",
+        }
+
+    monkeypatch.setattr(llm_extraction, "run_briefing", fake_briefing)
+    monkeypatch.setattr(llm_extraction, "run_transcription", fake_transcription)
+    monkeypatch.setattr(llm_extraction, "run_tagging", fake_tagging)
 
     result = run_enrichment(
         storage=storage,
@@ -284,6 +362,7 @@ def test_run_enrichment_writes_app_ready_outputs(tmp_path, monkeypatch) -> None:
         corpus="test",
         llm_provider="openai",
         llm_models=["gpt-4o-mini", "gpt-4o"],
+        streaming=False,
     )
 
     assert len(result["people"]) == 1
@@ -337,7 +416,49 @@ def test_tei_prompt_includes_speaker_context_and_full_text() -> None:
     assert "A = John Bonfield" not in user_content
     assert '"answer_speaker": "John Bonfield"' in user_content
     assert "Q What is your name?" in user_content
-    assert "speaker_person_id" in user_content
+    # Stage B no longer carries entity-extraction instructions; the transcription
+    # prompt should mention the canonical speaker directory instead.
+    assert "SPEAKER DIRECTORY" in user_content
+
+
+def test_split_tei_into_units_emits_one_unit_per_speech() -> None:
+    tei_xml = (
+        "<TEI xmlns=\"http://www.tei-c.org/ns/1.0\"><text><body><div>"
+        "<pb n=\"19\"/>"
+        "<sp who=\"#speaker_grinnell\"><speaker>MR. GRINNELL</speaker><p>What is your name?</p></sp>"
+        "<sp who=\"#speaker_bonfield\"><speaker>A</speaker><p>John Bonfield.</p></sp>"
+        "<pb n=\"20\"/>"
+        "<sp who=\"#speaker_bonfield\"><speaker>A</speaker><p>I am an inspector of police.</p></sp>"
+        "</div></body></text></TEI>"
+    )
+
+    units = split_tei_into_units(tei_xml)
+
+    assert [unit.speaker_id for unit in units] == [
+        "speaker_grinnell",
+        "speaker_bonfield",
+        "speaker_bonfield",
+    ]
+    assert [unit.kind for unit in units] == ["sp", "sp", "sp"]
+    assert units[0].page_ref == "19"
+    assert units[2].page_ref == "20"
+    assert "John Bonfield" in units[1].text
+
+
+def test_split_tei_into_units_falls_back_to_paragraphs_when_no_sp() -> None:
+    tei_xml = (
+        "<TEI xmlns=\"http://www.tei-c.org/ns/1.0\"><text><body><div>"
+        "<pb n=\"5\"/>"
+        "<p>Exhibit A: a circular.</p>"
+        "<p>Continued narrative.</p>"
+        "</div></body></text></TEI>"
+    )
+
+    units = split_tei_into_units(tei_xml)
+
+    assert len(units) == 2
+    assert all(unit.kind == "p" for unit in units)
+    assert units[0].page_ref == "5"
 
 
 def test_generated_tei_validation_detects_text_drift() -> None:

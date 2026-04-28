@@ -16,6 +16,9 @@ def run_enrichment(
     corpus: str,
     llm_provider: str,
     llm_models: list[str],
+    briefing_model: str = "gpt-4.1-mini",
+    max_tagging_workers: int = 8,
+    streaming: bool = True,
 ) -> dict[str, list[dict[str, Any]]]:
     pages = load_pages(storage, run_id)
     extraction = extract_pages_with_audit(
@@ -24,6 +27,9 @@ def run_enrichment(
         run_id=run_id,
         provider=llm_provider,
         models=llm_models,
+        briefing_model=briefing_model,
+        max_tagging_workers=max_tagging_workers,
+        streaming=streaming,
     )
     failed_calls = [record for record in extraction["audit_records"] if record["status"] == "error"]
     successful_calls = [record for record in extraction["audit_records"] if record["status"] == "success"]
@@ -35,6 +41,7 @@ def run_enrichment(
         raise RuntimeError("All LLM extraction calls failed; see raw/haymarket/llm audit files for details.")
 
     print(f"LLM extraction successes: {len(successful_calls)} of {len(extraction['audit_records'])} calls")
+    print_cost_summary(extraction["cost_summary"])
     print_model_eval(extraction["model_eval"])
 
     selected_model = choose_output_model(extraction["model_eval"])
@@ -107,6 +114,24 @@ def run_enrichment(
         "model_eval": extraction["model_eval"],
         "cost_summary": extraction["cost_summary"],
     }
+
+
+def print_cost_summary(cost_summary: dict[str, Any]) -> None:
+    totals = cost_summary.get("totals", {})
+    print(
+        f"LLM cost totals: calls={totals.get('calls', 0)}, "
+        f"input_tokens={totals.get('input_tokens', 0)}, "
+        f"output_tokens={totals.get('output_tokens', 0)}, "
+        f"cost=${totals.get('cost_usd', 0.0):.6f}"
+    )
+    by_stage = cost_summary.get("by_stage") or {}
+    for stage, values in by_stage.items():
+        print(
+            f"  stage {stage}: calls={values.get('calls', 0)}, "
+            f"input_tokens={values.get('input_tokens', 0)}, "
+            f"output_tokens={values.get('output_tokens', 0)}, "
+            f"cost=${values.get('cost_usd', 0.0):.6f}"
+        )
 
 
 def print_model_eval(model_eval: dict[str, Any]) -> None:

@@ -41,6 +41,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clear-data", action="store_true", help="Clear generated Haymarket raw/enriched artifacts before running")
     parser.add_argument("--llm-provider", choices=["openai"], default="openai")
     parser.add_argument("--llm-model", nargs="+", default=["gpt-4o-mini"])
+    parser.add_argument(
+        "--briefing-model",
+        default="gpt-4.1-mini",
+        help="Fixed model used for Stage A briefing (shared across the per-model slate)",
+    )
+    parser.add_argument(
+        "--max-tagging-workers",
+        type=int,
+        default=8,
+        help="Concurrent OpenAI calls during Stage C tagging",
+    )
+    parser.add_argument(
+        "--no-streaming",
+        action="store_true",
+        help="Suppress per-stage progress lines (useful in CI)",
+    )
     parser.add_argument("--geocode", action="store_true", help="Run geolocation after enrichment")
     parser.add_argument("--geocoder", choices=["google"], default="google")
     parser.add_argument("--geocode-llm-model", default="gpt-4o-mini")
@@ -96,6 +112,9 @@ def main() -> None:
                 corpus=args.corpus,
                 llm_provider=args.llm_provider,
                 llm_models=args.llm_model,
+                briefing_model=args.briefing_model,
+                max_tagging_workers=args.max_tagging_workers,
+                streaming=not args.no_streaming,
             )
             print(
                 "Enriched "

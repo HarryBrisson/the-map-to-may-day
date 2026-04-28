@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://the-map-to-may-day.local/schemas/briefing.schema.json",
+  "title": "Page Briefing",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "source_id",
+    "summary",
+    "witness",
+    "examiners",
+    "defendants_referenced",
+    "key_locations",
+    "key_dates",
+    "topics",
+    "speaker_directory"
+  ],
+  "properties": {
+    "source_id": { "type": "string" },
+    "summary": { "type": "string" },
+    "witness": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["name", "role"],
+      "properties": {
+        "name": { "type": "string" },
+        "role": { "type": ["string", "null"] }
+      }
+    },
+    "examiners": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "side"],
+        "properties": {
+          "name": { "type": "string" },
+          "side": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "defendants_referenced": { "type": "array", "items": { "type": "string" } },
+    "key_locations": { "type": "array", "items": { "type": "string" } },
+    "key_dates": { "type": "array", "items": { "type": "string" } },
+    "topics": { "type": "array", "items": { "type": "string" } },
+    "speaker_directory": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["speaker_id", "display_name", "role"],
+        "properties": {
+          "speaker_id": { "type": "string" },
+          "display_name": { "type": "string" },
+          "role": { "type": ["string", "null"] }
+        }
+      }
+    }
+  }
+}
