@@ -16,14 +16,35 @@ def run_enrichment(
     corpus: str,
     llm_provider: str,
     llm_models: list[str],
+    briefing_model: str = "gpt-4.1-mini",
+    tagging_model: str | None = None,
+    max_tagging_workers: int = 8,
+    max_tagging_unit_attempts: int = 3,
+    streaming: bool = True,
+    page_filter: list[str] | None = None,
+    max_transcription_attempts: int = 2,
+    transcription_format: str = "tei",
 ) -> dict[str, list[dict[str, Any]]]:
     pages = load_pages(storage, run_id)
+    if page_filter:
+        before = len(pages)
+        pages = [page for page in pages if any(token in page["id"] for token in page_filter)]
+        print(f"Filtered pages by {page_filter}: {before} -> {len(pages)} page(s)")
+        if not pages:
+            raise RuntimeError(f"--pages filter {page_filter} matched 0 pages")
     extraction = extract_pages_with_audit(
         pages=pages,
         storage=storage,
         run_id=run_id,
         provider=llm_provider,
         models=llm_models,
+        briefing_model=briefing_model,
+        tagging_model=tagging_model,
+        max_tagging_workers=max_tagging_workers,
+        max_tagging_unit_attempts=max_tagging_unit_attempts,
+        streaming=streaming,
+        max_transcription_attempts=max_transcription_attempts,
+        transcription_format=transcription_format,
     )
     failed_calls = [record for record in extraction["audit_records"] if record["status"] == "error"]
     successful_calls = [record for record in extraction["audit_records"] if record["status"] == "success"]
@@ -118,10 +139,20 @@ def print_cost_summary(cost_summary: dict[str, Any]) -> None:
     )
     for model, values in cost_summary.get("by_model", {}).items():
         print(f"  {model}: ${values.get('cost_usd', 0):.6f} ({values.get('calls', 0)} calls)")
+    for stage, values in cost_summary.get("by_stage", {}).items():
+        print(
+            f"  stage {stage}: ${values.get('cost_usd', 0):.6f} "
+            f"({values.get('calls', 0)} calls, "
+            f"{values.get('input_tokens', 0)} input + {values.get('output_tokens', 0)} output tokens)"
+        )
 
 
 def print_model_eval(model_eval: dict[str, Any]) -> None:
-    for model in model_eval.get("models", []):
+    models = model_eval.get("models", [])
+    if not models:
+        return
+    if len(models) == 1:
+        model = models[0]
         print(
             "Model "
             f"{model['model']}: parse_success={model['parse_success_rate']:.0%}, "
@@ -133,6 +164,33 @@ def print_model_eval(model_eval: dict[str, Any]) -> None:
             f"tei_valid={model.get('tei_valid_count', 0)}/{model['pages']}, "
             f"cost=${model['cost_usd']:.6f}"
         )
+        return
+
+    headers = ["model", "pages", "valid", "people", "locs", "claims", "events", "quotes", "cost"]
+    rows = [
+        [
+            model["model"],
+            str(model["pages"]),
+            f"{model.get('tei_valid_count', 0)}/{model['pages']}",
+            str(model["people_count"]),
+            str(model["location_count"]),
+            str(model["claim_count"]),
+            str(model["event_suggestion_count"]),
+            str(model.get("quote_count", 0)),
+            f"${model['cost_usd']:.4f}",
+        ]
+        for model in models
+    ]
+    widths = [max(len(headers[i]), *(len(row[i]) for row in rows)) for i in range(len(headers))]
+
+    def format_row(values: list[str]) -> str:
+        return "  ".join(value.ljust(widths[i]) for i, value in enumerate(values))
+
+    print("Model comparison:")
+    print("  " + format_row(headers))
+    print("  " + format_row(["-" * w for w in widths]))
+    for row in rows:
+        print("  " + format_row(row))
 
 
 def load_pages(storage: JsonStorage, run_id: str) -> list[dict[str, Any]]:
