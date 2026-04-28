@@ -5,7 +5,7 @@ import xml.etree.ElementTree as ET
 from difflib import SequenceMatcher
 from typing import Any
 
-from sources.hadc_source import TEI_NS, XML_NS, tei_tag, tei_to_transcript_json
+from sources.hadc_source import TEI_NS, XML_NS, parse_tei_xml, tei_tag, tei_to_transcript_json
 
 
 TEXT_DRIFT_MIN_RATIO = 0.92
@@ -24,7 +24,7 @@ def validate_generated_tei(page: dict[str, Any], tei_xml: str) -> dict[str, Any]
         "warnings": [],
     }
     try:
-        root = ET.fromstring(tei_xml)
+        root = parse_tei_xml(tei_xml)
     except ET.ParseError as exc:
         validation["status"] = "invalid"
         validation["errors"].append(f"XML parse error: {exc}")
