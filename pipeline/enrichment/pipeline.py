@@ -31,11 +31,11 @@ def run_enrichment(
         print(f"LLM extraction errors: {len(failed_calls)} of {len(extraction['audit_records'])} calls failed")
         for record in failed_calls[:3]:
             print(f"- {record['call_id']}: {record['error']}")
-    if not successful_calls:
-        raise RuntimeError("All LLM extraction calls failed; see raw/haymarket/llm audit files for details.")
-
     print(f"LLM extraction successes: {len(successful_calls)} of {len(extraction['audit_records'])} calls")
     print_model_eval(extraction["model_eval"])
+    print_cost_summary(extraction["cost_summary"])
+    if not successful_calls:
+        raise RuntimeError("All LLM extraction calls failed; see raw/haymarket/llm audit files for details.")
 
     selected_model = choose_output_model(extraction["model_eval"])
     print(f"Selected model for app-ready output: {selected_model}")
@@ -107,6 +107,17 @@ def run_enrichment(
         "model_eval": extraction["model_eval"],
         "cost_summary": extraction["cost_summary"],
     }
+
+
+def print_cost_summary(cost_summary: dict[str, Any]) -> None:
+    totals = cost_summary.get("totals", {})
+    print(
+        "LLM cost: "
+        f"${totals.get('cost_usd', 0):.6f} total across {totals.get('calls', 0)} calls "
+        f"({totals.get('input_tokens', 0)} input + {totals.get('output_tokens', 0)} output tokens)"
+    )
+    for model, values in cost_summary.get("by_model", {}).items():
+        print(f"  {model}: ${values.get('cost_usd', 0):.6f} ({values.get('calls', 0)} calls)")
 
 
 def print_model_eval(model_eval: dict[str, Any]) -> None:

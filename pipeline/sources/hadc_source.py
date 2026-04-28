@@ -337,6 +337,40 @@ def tei_tag(name: str) -> str:
     return f"{{{TEI_NS}}}{name}"
 
 
+HTML_VOID_TAGS = ("br", "hr", "img", "lb", "pb", "milestone", "link", "meta")
+
+
+def parse_tei_xml(tei_xml: str) -> ET.Element:
+    """Parse possibly-imperfect TEI from an LLM, tolerating two common defects:
+
+    - HTML-style void tags like <br> emitted instead of <br/>
+    - Missing TEI namespace declaration on the root element
+    """
+    normalized = tei_xml
+    for tag in HTML_VOID_TAGS:
+        normalized = re.sub(
+            rf"<{tag}((?:\s[^/>]*)?)>(?!\s*</{tag}\s*>)",
+            rf"<{tag}\1/>",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+
+    # Canonicalize the root element name to "TEI" so we can detect/inject the namespace.
+    # Lookahead avoids matching "teiHeader", "teiCorpus", etc.
+    normalized = re.sub(r"(<\s*/?)\s*tei(?=[\s/>])", r"\1TEI", normalized)
+
+    # Inject the TEI namespace on the root if it isn't already declared
+    if not re.search(rf'xmlns\s*=\s*"{re.escape(TEI_NS)}"', normalized):
+        normalized = re.sub(
+            r"<\s*TEI\b([^>]*)>",
+            lambda m: f'<TEI xmlns="{TEI_NS}"{m.group(1)}>',
+            normalized,
+            count=1,
+        )
+
+    return ET.fromstring(normalized)
+
+
 def build_tei_transcript(
     source_id: str,
     url: str,
@@ -421,7 +455,7 @@ def tei_to_transcript_json(
     tei_xml: str,
     transcript_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    root = ET.fromstring(tei_xml)
+    root = parse_tei_xml(tei_xml)
     body = root.find(f".//{tei_tag('body')}")
     segments: list[dict[str, Any]] = []
     page_refs: list[dict[str, Any]] = []

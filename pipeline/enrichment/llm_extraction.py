@@ -63,9 +63,12 @@ def extract_pages_with_audit(
     for model in models:
         bundles_by_model[model] = []
         for page in pages:
+            if page.get("source_type") == "toc":
+                print(f"Skipping LLM TEI extraction for {page['id']} (source_type=toc)")
+                continue
             call = extract_one_page(page=page, storage=storage, run_id=run_id, provider=provider, model=model)
             audit_records.append(call)
-            if isinstance(call["parsed_output"], dict):
+            if call["status"] == "success" and isinstance(call["parsed_output"], dict):
                 bundles_by_model[model].append(call["parsed_output"])
 
             model_path = slugify(model)
@@ -141,9 +144,10 @@ def extract_one_page(
 
         cost_usd = estimate_cost_usd(model, usage)
     except TEIValidationError as exc:
-        parsed_output = None
-        raw_output = {"tei_validation": exc.validation}
-        usage = usage
+        parsed_output = combine_chunk_outputs(page, parsed_chunks) if parsed_chunks else None
+        if isinstance(parsed_output, dict):
+            parsed_output["tei_validation"] = exc.validation
+        raw_output = raw_outputs[0] if len(raw_outputs) == 1 else (raw_outputs or {"tei_validation": exc.validation})
         cost_usd = estimate_cost_usd(model, usage)
         status = "error"
         error = str(exc)
@@ -208,10 +212,15 @@ def build_messages(page: dict[str, Any], chunk: dict[str, Any] | None = None) ->
                 f"Type: {page['source_type']}\n\n"
                 "Return a JSON object with keys: source_id, tei_xml, people, locations, claims, "
                 "event_suggestions, quotes.\n"
-                "The tei_xml must be well-formed TEI. Include pb elements for page cues, sp/speaker/p for "
-                "testimony, sp@who where the speaker is known, inline seg elements for people, locations, "
-                "events, and claim evidence, and standOff lists/annotations for provisional entities, claims, "
-                "and quotes. Use provisional IDs where canonical IDs are uncertain.\n"
+                "The tei_xml MUST be well-formed XML following these rules:\n"
+                "- The root element MUST be exactly: <TEI xmlns=\"http://www.tei-c.org/ns/1.0\"> (uppercase TEI, namespace declared).\n"
+                "- All empty elements MUST be self-closed: <pb n=\"17\"/>, <lb/>, <gap/>. Never write <br>, <pb> with no slash, etc.\n"
+                "- Do NOT use any HTML tags (no <br>, <b>, <i>, <img>, <a>). Use TEI equivalents: <lb/> for line breaks, "
+                "<hi rend=\"bold\">…</hi> for emphasis, <figure><graphic url=\"…\"/></figure> for images.\n"
+                "- Quote attribute values with double quotes; escape &, <, > as &amp;, &lt;, &gt; in text content.\n"
+                "Include pb elements for page cues, sp/speaker/p for testimony, sp@who where the speaker is known, "
+                "inline seg elements for people, locations, events, and claim evidence, and standOff lists/annotations "
+                "for provisional entities, claims, and quotes. Use provisional IDs where canonical IDs are uncertain.\n"
                 "Claims should include reporter/speaker person IDs, claim date, event time, location, subject "
                 "people, statement, quote, page refs, and confidence. Quotes must include speaker_person_id, "
                 "speaker_label, quote text, and page refs when available.\n"
@@ -502,7 +511,7 @@ def build_model_eval(run_id: str, bundles_by_model: dict[str, list[dict[str, Any
     models = []
     for model, bundles in bundles_by_model.items():
         records = [record for record in audit_records if record["model"] == model]
-        successful = [record for record in records if record["parsed_output"]]
+        successful = [record for record in records if record["status"] == "success"]
         cost = round(sum(record["cost_usd"] for record in records), 8)
         missing = collect_missing_required_fields(bundles)
         models.append(

@@ -40,7 +40,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-id", default="")
     parser.add_argument("--clear-data", action="store_true", help="Clear generated Haymarket raw/enriched artifacts before running")
     parser.add_argument("--llm-provider", choices=["openai"], default="openai")
-    parser.add_argument("--llm-model", nargs="+", default=["gpt-4o-mini"])
+    parser.add_argument(
+        "--llm-model",
+        nargs="+",
+        default=None,
+        help=(
+            "One or more OpenAI model names. Defaults: --test runs a comparison slate "
+            "(gpt-4o-mini, gpt-4.1-mini, gpt-4o); --corpus full runs gpt-4o."
+        ),
+    )
     parser.add_argument("--geocode", action="store_true", help="Run geolocation after enrichment")
     parser.add_argument("--geocoder", choices=["google"], default="google")
     parser.add_argument("--geocode-llm-model", default="gpt-4o-mini")
@@ -62,6 +70,10 @@ def main() -> None:
     args = parse_args()
     if args.test:
         args.corpus = "test"
+    if args.llm_model is None:
+        args.llm_model = (
+            ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4o"] if args.corpus == "test" else ["gpt-4o"]
+        )
 
     run_id = args.run_id or make_run_id()
     storage = make_storage(
