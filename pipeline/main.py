@@ -88,8 +88,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--briefing-model",
-        default="gpt-4.1-mini",
-        help="Fixed model used for Stage A briefing (shared across model slate).",
+        default="gpt-5-mini",
+        help=(
+            "Fixed model used for Stage A briefing (shared across model slate). "
+            "Default gpt-5-mini: reasoning-class but cheaper than gpt-4.1-mini and "
+            "produces more consistent speaker_directory IDs/names than non-reasoning "
+            "models."
+        ),
     )
     parser.add_argument(
         "--tagging-model",

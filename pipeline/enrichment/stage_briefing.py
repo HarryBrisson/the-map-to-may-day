@@ -17,14 +17,22 @@ from utils.s3_storage import JsonStorage
 
 
 BRIEFING_PROMPT_TEMPLATE = "haymarket_page_briefing_v1"
-BRIEFING_MAX_OUTPUT_TOKENS = 2_000
+# Bumped from 2k to 8k so reasoning models (gpt-5 family) have room for both
+# reasoning tokens and the structured answer. Briefing identifying every
+# speaker on a long page benefits from reasoning, but the budget needs
+# headroom or the JSON answer gets truncated like Stage C did.
+BRIEFING_MAX_OUTPUT_TOKENS = 8_000
+# Briefing asks the model to find every named speaker, canonicalize names,
+# infer roles — a reasoning-friendly task. "low" effort preserves output
+# budget while still giving the model a few hundred tokens to think.
+BRIEFING_REASONING_EFFORT = "low"
 
 
 def run_briefing(
     page: dict[str, Any],
     storage: JsonStorage,
     run_id: str,
-    model: str = "gpt-4.1-mini",
+    model: str = "gpt-5-mini",
     progress: StageProgress | None = None,
 ) -> dict[str, Any]:
     progress = progress or StageProgress(page["id"], "briefing", enabled=False)
@@ -41,6 +49,7 @@ def run_briefing(
             schema=schema,
             schema_name="haymarket_page_briefing",
             max_output_tokens=BRIEFING_MAX_OUTPUT_TOKENS,
+            reasoning_effort=BRIEFING_REASONING_EFFORT,
         )
         # Force speaker_directory IDs into canonical person_<slug> form so
         # downstream stages (TEI <sp who>, person.id in tagging) share one

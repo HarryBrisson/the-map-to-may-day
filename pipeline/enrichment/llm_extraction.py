@@ -10,7 +10,7 @@ from enrichment.stage_transcription import run_transcription
 from utils.openai_schema import LLMCallError, MODEL_PRICING_PER_1M, estimate_cost_usd
 
 
-DEFAULT_BRIEFING_MODEL = "gpt-4.1-mini"
+DEFAULT_BRIEFING_MODEL = "gpt-5-mini"
 
 
 def extract_pages_with_audit(
