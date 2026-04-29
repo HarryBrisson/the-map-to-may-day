@@ -249,6 +249,7 @@ def tag_one_unit(
             max_output_tokens=TAGGING_MAX_OUTPUT_TOKENS,
             reasoning_effort=TAGGING_REASONING_EFFORT,
         )
+        _normalize_entity_ids(parsed)
         cost_usd = estimate_cost_usd(model, usage)
         return {
             "unit_id": unit.unit_id,
@@ -299,9 +300,13 @@ def build_tagging_messages(
                 "testimony. You are given a page-level briefing for global context and the immediately "
                 "preceding segments for local context. Only return information directly supported by "
                 "the CURRENT segment text — never invent details from the briefing alone. IDs you mint "
-                "for new entities/claims/quotes must follow the schema patterns (e.g. 'person_…', "
-                "'location_…', 'claim_…'). Reuse IDs from the briefing's speaker_directory when "
-                "speakers match. Set source_id on claims/quotes to the page's source_id."
+                "for new entities/claims/quotes must follow the schema patterns: 'person_…', "
+                "'location_…', 'claim_…', 'event_…'. When a person you extract appears in the "
+                "briefing's speaker_directory, you MUST reuse that exact speaker_id as the person's "
+                "id (NOT the '#'-prefixed form — drop the '#' since person.id is a bare id, not a "
+                "TEI ref). For example, if the directory has speaker_id 'person_john_bonfield' and "
+                "the current segment names John Bonfield, your person record's id MUST be "
+                "'person_john_bonfield'. Set source_id on claims/quotes to the page's source_id."
             ),
         },
         {
@@ -475,6 +480,24 @@ def _build_page_ref_index(body: ET.Element) -> dict[int, str | None]:
         else:
             index[id(element)] = current_ref
     return index
+
+
+def _normalize_entity_ids(parsed: dict[str, Any] | None) -> None:
+    """Strip the '#' prefix from entity ids the model accidentally copied
+    from TEI ref form. Stage A's speaker_directory ids are bare
+    ('person_john_bonfield') but the TEI ref uses '#person_john_bonfield';
+    the model sometimes copies the latter as a person.id, which violates
+    the ^person_ schema and creates duplicate entities.
+    """
+    if not isinstance(parsed, dict):
+        return
+    for key in ("people", "locations", "claims", "events", "quotes"):
+        items = parsed.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"].startswith("#"):
+                item["id"] = item["id"].lstrip("#")
 
 
 def _resolve_unit_id(element: ET.Element, prefix: str, index: int) -> str:

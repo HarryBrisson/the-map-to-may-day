@@ -50,6 +50,53 @@ def test_briefing_schema_matches_strict_response_format_subset() -> None:
     assert_openai_strict_schema(schema)
 
 
+def test_normalize_speaker_directory_canonicalizes_ids_to_person_slug() -> None:
+    from enrichment.stage_briefing import normalize_speaker_directory
+
+    briefing = {
+        "speaker_directory": [
+            {"speaker_id": "#bonfield", "display_name": "John Bonfield", "role": "witness"},
+            {"speaker_id": "#mr-grinnell", "display_name": "Mr. Grinnell", "role": "prosecutor"},
+            {"speaker_id": "JOHN_BONFIELD", "display_name": "John Bonfield", "role": "witness"},  # duplicate
+        ],
+    }
+    normalize_speaker_directory(briefing)
+    ids = [entry["speaker_id"] for entry in briefing["speaker_directory"]]
+    assert ids == ["person_john_bonfield", "person_mr_grinnell"]
+    # Duplicate display_name collapses to one entry
+    assert len(briefing["speaker_directory"]) == 2
+
+
+def test_stage_c_strips_hash_prefix_from_entity_ids(monkeypatch) -> None:
+    from enrichment.stage_tagging import TaggingUnit, tag_one_unit
+
+    def fake_call(model, input_messages, schema, schema_name, max_output_tokens=None, reasoning_effort=None):
+        del model, input_messages, schema, schema_name, max_output_tokens, reasoning_effort
+        return (
+            {
+                "unit_id": "sp_001",
+                "people": [
+                    {"id": "#person_john_bonfield", "display_name": "John Bonfield",
+                     "alternate_names": [], "roles": [], "bio": {}, "source_ids": [], "confidence": 0.9},
+                ],
+                "locations": [],
+                "claims": [],
+                "events": [],
+                "quotes": [],
+            },
+            {},
+            {"input_tokens": 100, "output_tokens": 50, "total_tokens": 150},
+        )
+
+    monkeypatch.setattr(stage_tagging, "call_openai_structured", fake_call)
+    unit = TaggingUnit(unit_id="sp_001", kind="sp", speaker_id="bonfield",
+                       page_ref="17", text="John Bonfield.", tei_snippet="<sp/>")
+    row = tag_one_unit(page={"id": "p"}, briefing=None, unit=unit,
+                      prior_units=[], model="gpt-5-mini", schema={})
+    assert row["status"] == "success"
+    assert row["tags"]["people"][0]["id"] == "person_john_bonfield"  # # stripped
+
+
 def test_extract_tei_from_text_strips_preamble_and_code_fences() -> None:
     fenced = """Sure, here is the TEI:
 ```xml
