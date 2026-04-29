@@ -32,9 +32,12 @@ else
 fi
 
 # ----------------------------------------------------------------------------
-# Helper: run one experiment with a named run_id.
+# Helper: run one experiment with a named run_id. Failures are logged but
+# do NOT abort the script — we want to see how every config performs even
+# when some don't validate, so the comparison summary at the end is complete.
 # ----------------------------------------------------------------------------
 LABELS=()
+FAILURES=()
 run_experiment() {
     local label="$1"; shift
     LABELS+=("$label")
@@ -44,7 +47,10 @@ run_experiment() {
     echo "Args: $*"
     echo "Started: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "================================================================"
-    "${PIPELINE[@]}" --action enrich --pages "$PAGE" --run-id "$label" "$@"
+    if ! "${PIPELINE[@]}" --action enrich --pages "$PAGE" --run-id "$label" "$@"; then
+        echo "  (experiment $label exited non-zero — continuing to next)"
+        FAILURES+=("$label")
+    fi
 }
 
 # ----------------------------------------------------------------------------
@@ -78,6 +84,14 @@ run_experiment "exp_55tei_5minitag" \
 # Same, but JSONL — direct A/B vs the row above to isolate format effect.
 run_experiment "exp_55jsonl_5minitag" \
     --llm-model gpt-5.5 \
+    --transcription-format jsonl \
+    --tagging-model gpt-5-mini
+
+# --- gpt-5.4: half the price of gpt-5.5. Does it pass Stage B at 0.95? ---
+# 5.4 is $2.50/$15 vs 5.5's $5/$30. If it can transcribe at >=0.95
+# token_recall it's a no-brainer cost cut.
+run_experiment "exp_54jsonl_5minitag" \
+    --llm-model gpt-5.4 \
     --transcription-format jsonl \
     --tagging-model gpt-5-mini
 
@@ -120,6 +134,10 @@ run_experiment "exp_tag_54mini" \
 echo
 echo "================================================================"
 echo "All experiments complete."
+if (( ${#FAILURES[@]} > 0 )); then
+    echo "Failed (Stage B validation or other error): ${FAILURES[*]}"
+    echo "Their audits are still on disk under data/raw/haymarket/llm/<label>/"
+fi
 echo "================================================================"
 echo
 echo "Audit dirs:"

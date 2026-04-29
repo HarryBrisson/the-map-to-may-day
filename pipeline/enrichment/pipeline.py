@@ -24,6 +24,7 @@ def run_enrichment(
     page_filter: list[str] | None = None,
     max_transcription_attempts: int = 2,
     transcription_format: str = "tei",
+    use_cache: bool = True,
 ) -> dict[str, list[dict[str, Any]]]:
     pages = load_pages(storage, run_id)
     if page_filter:
@@ -45,14 +46,19 @@ def run_enrichment(
         streaming=streaming,
         max_transcription_attempts=max_transcription_attempts,
         transcription_format=transcription_format,
+        use_cache=use_cache,
     )
     failed_calls = [record for record in extraction["audit_records"] if record["status"] == "error"]
-    successful_calls = [record for record in extraction["audit_records"] if record["status"] == "success"]
+    successful_calls = [
+        record for record in extraction["audit_records"] if record["status"] in ("success", "cached")
+    ]
+    cached_calls = [record for record in extraction["audit_records"] if record["status"] == "cached"]
     if failed_calls:
         print(f"LLM extraction errors: {len(failed_calls)} of {len(extraction['audit_records'])} calls failed")
         for record in failed_calls[:3]:
             print(f"- {record['call_id']}: {record['error']}")
-    print(f"LLM extraction successes: {len(successful_calls)} of {len(extraction['audit_records'])} calls")
+    cache_note = f" ({len(cached_calls)} from cache)" if cached_calls else ""
+    print(f"LLM extraction successes: {len(successful_calls)} of {len(extraction['audit_records'])} calls{cache_note}")
     print_model_eval(extraction["model_eval"])
     print_cost_summary(extraction["cost_summary"])
     if not successful_calls:
@@ -132,18 +138,24 @@ def run_enrichment(
 
 def print_cost_summary(cost_summary: dict[str, Any]) -> None:
     totals = cost_summary.get("totals", {})
+    reasoning = totals.get("reasoning_tokens", 0)
+    reasoning_suffix = f", {reasoning} reasoning" if reasoning else ""
     print(
         "LLM cost: "
         f"${totals.get('cost_usd', 0):.6f} total across {totals.get('calls', 0)} calls "
-        f"({totals.get('input_tokens', 0)} input + {totals.get('output_tokens', 0)} output tokens)"
+        f"({totals.get('input_tokens', 0)} input + {totals.get('output_tokens', 0)} "
+        f"output tokens{reasoning_suffix})"
     )
     for model, values in cost_summary.get("by_model", {}).items():
         print(f"  {model}: ${values.get('cost_usd', 0):.6f} ({values.get('calls', 0)} calls)")
     for stage, values in cost_summary.get("by_stage", {}).items():
+        stage_reasoning = values.get("reasoning_tokens", 0)
+        stage_reasoning_suffix = f", {stage_reasoning} reasoning" if stage_reasoning else ""
         print(
             f"  stage {stage}: ${values.get('cost_usd', 0):.6f} "
             f"({values.get('calls', 0)} calls, "
-            f"{values.get('input_tokens', 0)} input + {values.get('output_tokens', 0)} output tokens)"
+            f"{values.get('input_tokens', 0)} input + {values.get('output_tokens', 0)} "
+            f"output tokens{stage_reasoning_suffix})"
         )
 
 
@@ -331,14 +343,34 @@ def write_harmonized_transcripts(storage: JsonStorage, pages: list[dict[str, Any
         if not bundle or not bundle.get("tei_xml") or not tei_path or not transcript_path:
             continue
 
-        storage.write_text(tei_path, bundle["tei_xml"], "application/tei+xml; charset=utf-8")
-        transcript_index = tei_to_transcript_json(
+        # First pass: render the bundle TEI to extract plain text so we can
+        # locate every mention of an entity's display_name / alternate_names
+        # in the transcript.
+        base_transcript = tei_to_transcript_json(
             source_id=page["id"],
             url=page["url"],
             title=page["title"],
             source_type=page["source_type"],
             fetched_at=page["fetched_at"],
             tei_xml=bundle["tei_xml"],
+            transcript_metadata=page.get("transcript_metadata", {}),
+        )
+        # Find literal mentions in the text and add them as standoff
+        # annotations on the TEI. Without this the app sees segments and
+        # speaker attribution but no entity-to-text linkage.
+        mentions = build_annotation_mentions(base_transcript["text"], bundle)
+        annotated_tei = add_standoff_annotations_to_tei(bundle["tei_xml"], mentions)
+        storage.write_text(tei_path, annotated_tei, "application/tei+xml; charset=utf-8")
+
+        # Second pass: re-render the transcript index from the annotated TEI
+        # so the published transcript JSON includes the inline mentions.
+        transcript_index = tei_to_transcript_json(
+            source_id=page["id"],
+            url=page["url"],
+            title=page["title"],
+            source_type=page["source_type"],
+            fetched_at=page["fetched_at"],
+            tei_xml=annotated_tei,
             transcript_metadata=page.get("transcript_metadata", {}),
         )
         storage.write_json(transcript_path, transcript_index)

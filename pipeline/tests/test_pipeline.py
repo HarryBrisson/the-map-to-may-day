@@ -50,6 +50,132 @@ def test_briefing_schema_matches_strict_response_format_subset() -> None:
     assert_openai_strict_schema(schema)
 
 
+def test_page_cache_hit_skips_all_three_stages(tmp_path, monkeypatch) -> None:
+    """Two-pass test: first run populates cache, second run reads from it."""
+    from utils.page_cache import compute_cache_key, write_cached_bundle, read_cached_bundle
+
+    storage = LocalJsonStorage(tmp_path)
+    page = {
+        "id": "source_hadc_test",
+        "candidate_text_sha256": "sha-of-text",
+        "url": "https://example.test/test.htm",
+    }
+    cache_key = compute_cache_key(
+        page,
+        briefing_model="gpt-5-mini",
+        transcription_model="gpt-5.5",
+        transcription_format="jsonl",
+        tagging_model="gpt-5-mini",
+        briefing_prompt_template="b_v1",
+        transcription_prompt_template="t_v1",
+        tagging_prompt_template="c_v1",
+    )
+
+    # Cache miss before any writes
+    assert read_cached_bundle(storage, cache_key, page["id"]) is None
+
+    bundle = {"source_id": page["id"], "tei_xml": "<TEI/>", "people": [], "locations": [],
+              "claims": [], "event_suggestions": [], "quotes": []}
+    write_cached_bundle(
+        storage,
+        cache_key,
+        page["id"],
+        bundle,
+        run_id="prior_run",
+        config={"briefing_model": "gpt-5-mini"},
+        cost_usd=1.50,
+        usage={"input_tokens": 100, "output_tokens": 50, "total_tokens": 150,
+               "reasoning_tokens": 0, "cached_input_tokens": 0},
+    )
+
+    # Cache hit after write
+    cached = read_cached_bundle(storage, cache_key, page["id"])
+    assert cached is not None
+    cached_bundle, cached_metadata = cached
+    assert cached_bundle == bundle
+    assert cached_metadata["produced_by_run_id"] == "prior_run"
+    assert cached_metadata["cost_usd"] == 1.50
+
+
+def test_compute_cache_key_changes_when_config_changes() -> None:
+    from utils.page_cache import compute_cache_key
+
+    page = {"id": "p", "candidate_text_sha256": "abc"}
+    base_args = dict(
+        briefing_model="gpt-5-mini",
+        transcription_model="gpt-5.5",
+        transcription_format="jsonl",
+        tagging_model="gpt-5-mini",
+        briefing_prompt_template="b_v1",
+        transcription_prompt_template="t_v1",
+        tagging_prompt_template="c_v1",
+    )
+    baseline = compute_cache_key(page, **base_args)
+
+    # Bumping a prompt version invalidates the key
+    bumped_prompt = compute_cache_key(page, **{**base_args, "tagging_prompt_template": "c_v2"})
+    assert bumped_prompt != baseline
+
+    # Switching models invalidates the key
+    swapped_model = compute_cache_key(page, **{**base_args, "transcription_model": "gpt-5.4"})
+    assert swapped_model != baseline
+
+    # Source text change invalidates the key
+    different_source = compute_cache_key({"id": "p", "candidate_text_sha256": "def"}, **base_args)
+    assert different_source != baseline
+
+    # Same inputs reproduce the same key
+    again = compute_cache_key(page, **base_args)
+    assert again == baseline
+
+
+def test_normalize_speaker_directory_canonicalizes_ids_to_person_slug() -> None:
+    from enrichment.stage_briefing import normalize_speaker_directory
+
+    briefing = {
+        "speaker_directory": [
+            {"speaker_id": "#bonfield", "display_name": "John Bonfield", "role": "witness"},
+            {"speaker_id": "#mr-grinnell", "display_name": "Mr. Grinnell", "role": "prosecutor"},
+            {"speaker_id": "JOHN_BONFIELD", "display_name": "John Bonfield", "role": "witness"},  # duplicate
+        ],
+    }
+    normalize_speaker_directory(briefing)
+    ids = [entry["speaker_id"] for entry in briefing["speaker_directory"]]
+    assert ids == ["person_john_bonfield", "person_mr_grinnell"]
+    # Duplicate display_name collapses to one entry
+    assert len(briefing["speaker_directory"]) == 2
+
+
+def test_stage_c_strips_hash_prefix_from_entity_ids(monkeypatch) -> None:
+    from enrichment.stage_tagging import TaggingUnit, tag_one_unit
+
+    def fake_call(model, input_messages, schema, schema_name, max_output_tokens=None, reasoning_effort=None):
+        del model, input_messages, schema, schema_name, max_output_tokens, reasoning_effort
+        return (
+            {
+                "unit_id": "sp_001",
+                "people": [
+                    {"id": "#person_john_bonfield", "display_name": "John Bonfield",
+                     "alternate_names": [], "roles": [], "bio": {}, "source_ids": [], "confidence": 0.9},
+                ],
+                "locations": [],
+                "claims": [],
+                "events": [],
+                "quotes": [],
+            },
+            {},
+            {"input_tokens": 100, "output_tokens": 50, "total_tokens": 150},
+        )
+
+    monkeypatch.setattr(stage_tagging, "call_openai_structured", fake_call)
+    unit = TaggingUnit(unit_id="sp_001", kind="sp", speaker_id="bonfield",
+                       page_ref="17", text="John Bonfield.", tei_snippet="<sp/>")
+    row = tag_one_unit(page={"id": "p"}, briefing=None, unit=unit,
+                      prior_units=[], model="gpt-5-mini", schema={})
+    assert row["status"] == "success"
+    assert row["tags"]["people"][0]["id"] == "person_john_bonfield"  # # stripped
+
+
 def test_extract_tei_from_text_strips_preamble_and_code_fences() -> None:
     fenced = """Sure, here is the TEI:
 ```xml
@@ -100,8 +226,8 @@ def test_tag_one_unit_with_retry_recovers_from_first_failure(monkeypatch) -> Non
 
     calls = {"count": 0}
 
-    def fake_call_openai_structured(model, input_messages, schema, schema_name, max_output_tokens=None):
-        del model, input_messages, schema, schema_name, max_output_tokens
+    def fake_call_openai_structured(model, input_messages, schema, schema_name, max_output_tokens=None, reasoning_effort=None):
+        del model, input_messages, schema, schema_name, max_output_tokens, reasoning_effort
         calls["count"] += 1
         if calls["count"] == 1:
             raise stage_tagging.LLMCallError(
@@ -411,16 +537,16 @@ def test_run_enrichment_writes_app_ready_outputs(tmp_path, monkeypatch) -> None:
     }
     usage = {"input_tokens": 100, "output_tokens": 100, "total_tokens": 200}
 
-    def structured_response(model, input_messages, schema, schema_name, max_output_tokens=None):
-        del model, input_messages, schema, max_output_tokens
+    def structured_response(model, input_messages, schema, schema_name, max_output_tokens=None, reasoning_effort=None):
+        del model, input_messages, schema, max_output_tokens, reasoning_effort
         if schema_name == "haymarket_page_briefing":
             return briefing, {"output": "structured"}, usage
         if schema_name == "haymarket_segment_tags":
             return tagging_payload, {"output": "structured"}, usage
         raise AssertionError(f"unexpected schema_name: {schema_name}")
 
-    def text_response(model, input_messages, max_output_tokens=None):
-        del model, input_messages, max_output_tokens
+    def text_response(model, input_messages, max_output_tokens=None, reasoning_effort=None):
+        del model, input_messages, max_output_tokens, reasoning_effort
         return transcription_tei, {"output": "text"}, usage
 
     monkeypatch.setattr(stage_briefing, "call_openai_structured", structured_response)

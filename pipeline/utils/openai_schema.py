@@ -92,14 +92,27 @@ def normalize_openai_schema(schema: Any) -> None:
             normalize_openai_schema(value)
 
 
+REASONING_MODEL_PREFIXES = ("gpt-5", "o1", "o3", "o4")
+
+
+def is_reasoning_model(model: str) -> bool:
+    return any(model.startswith(prefix) for prefix in REASONING_MODEL_PREFIXES)
+
+
 def call_openai_text(
     model: str,
     input_messages: list[dict[str, str]],
     max_output_tokens: int | None = None,
+    reasoning_effort: str | None = None,
 ) -> tuple[str, Any, dict[str, int]]:
     """Plain-text completion. Use when the response is not naturally JSON
     (e.g. raw TEI XML) — avoids the JSON-string-escape token tax that
-    structured outputs impose."""
+    structured outputs impose.
+
+    reasoning_effort applies only to reasoning models (gpt-5 family,
+    o-series). Pass "minimal" / "low" / "medium" / "high" to control how
+    many output tokens go to reasoning before the answer is emitted.
+    """
     from openai import OpenAI
 
     client = OpenAI()
@@ -109,17 +122,12 @@ def call_openai_text(
     }
     if max_output_tokens is not None:
         request["max_output_tokens"] = max_output_tokens
+    if reasoning_effort and is_reasoning_model(model):
+        request["reasoning"] = {"effort": reasoning_effort}
 
     response = client.responses.create(**request)
     raw_output = response.model_dump(mode="json")
-    usage_obj = raw_output.get("usage") or {}
-    input_tokens = usage_obj.get("input_tokens") or usage_obj.get("prompt_tokens") or 0
-    output_tokens = usage_obj.get("output_tokens") or usage_obj.get("completion_tokens") or 0
-    usage = {
-        "input_tokens": int(input_tokens),
-        "output_tokens": int(output_tokens),
-        "total_tokens": int(usage_obj.get("total_tokens") or input_tokens + output_tokens),
-    }
+    usage = _extract_usage(raw_output)
     return response.output_text, raw_output, usage
 
 
@@ -129,6 +137,7 @@ def call_openai_structured(
     schema: dict[str, Any],
     schema_name: str,
     max_output_tokens: int | None = None,
+    reasoning_effort: str | None = None,
 ) -> tuple[dict[str, Any], Any, dict[str, int]]:
     from openai import OpenAI
 
@@ -147,22 +156,42 @@ def call_openai_structured(
     }
     if max_output_tokens is not None:
         request["max_output_tokens"] = max_output_tokens
+    if reasoning_effort and is_reasoning_model(model):
+        request["reasoning"] = {"effort": reasoning_effort}
 
     response = client.responses.create(**request)
     raw_output = response.model_dump(mode="json")
-    usage_obj = raw_output.get("usage") or {}
-    input_tokens = usage_obj.get("input_tokens") or usage_obj.get("prompt_tokens") or 0
-    output_tokens = usage_obj.get("output_tokens") or usage_obj.get("completion_tokens") or 0
-    usage = {
-        "input_tokens": int(input_tokens),
-        "output_tokens": int(output_tokens),
-        "total_tokens": int(usage_obj.get("total_tokens") or input_tokens + output_tokens),
-    }
+    usage = _extract_usage(raw_output)
     try:
         parsed = json.loads(response.output_text)
     except Exception as exc:
         raise LLMCallError("OpenAI returned output that could not be parsed as JSON", raw_output, usage) from exc
     return parsed, raw_output, usage
+
+
+def _extract_usage(raw_output: dict[str, Any]) -> dict[str, int]:
+    """Pull token counts from a Responses API response.
+
+    OpenAI's `output_tokens` already includes reasoning tokens (and they
+    bill at the regular output rate), so cost is correct without further
+    adjustment. We pull `output_tokens_details.reasoning_tokens` out
+    separately for visibility — it lets us see whether reasoning_effort
+    is being honored and how much of the answer budget reasoning ate.
+    """
+    usage_obj = raw_output.get("usage") or {}
+    input_tokens = usage_obj.get("input_tokens") or usage_obj.get("prompt_tokens") or 0
+    output_tokens = usage_obj.get("output_tokens") or usage_obj.get("completion_tokens") or 0
+    output_details = usage_obj.get("output_tokens_details") or {}
+    input_details = usage_obj.get("input_tokens_details") or {}
+    reasoning_tokens = output_details.get("reasoning_tokens") or 0
+    cached_tokens = input_details.get("cached_tokens") or 0
+    return {
+        "input_tokens": int(input_tokens),
+        "output_tokens": int(output_tokens),
+        "total_tokens": int(usage_obj.get("total_tokens") or input_tokens + output_tokens),
+        "reasoning_tokens": int(reasoning_tokens),
+        "cached_input_tokens": int(cached_tokens),
+    }
 
 
 MODEL_PRICING_PER_1M = {

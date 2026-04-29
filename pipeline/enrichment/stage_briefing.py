@@ -17,14 +17,22 @@ from utils.s3_storage import JsonStorage
 
 
 BRIEFING_PROMPT_TEMPLATE = "haymarket_page_briefing_v1"
-BRIEFING_MAX_OUTPUT_TOKENS = 2_000
+# Bumped from 2k to 8k so reasoning models (gpt-5 family) have room for both
+# reasoning tokens and the structured answer. Briefing identifying every
+# speaker on a long page benefits from reasoning, but the budget needs
+# headroom or the JSON answer gets truncated like Stage C did.
+BRIEFING_MAX_OUTPUT_TOKENS = 8_000
+# Briefing asks the model to find every named speaker, canonicalize names,
+# infer roles — a reasoning-friendly task. "low" effort preserves output
+# budget while still giving the model a few hundred tokens to think.
+BRIEFING_REASONING_EFFORT = "low"
 
 
 def run_briefing(
     page: dict[str, Any],
     storage: JsonStorage,
     run_id: str,
-    model: str = "gpt-4.1-mini",
+    model: str = "gpt-5-mini",
     progress: StageProgress | None = None,
 ) -> dict[str, Any]:
     progress = progress or StageProgress(page["id"], "briefing", enabled=False)
@@ -41,7 +49,13 @@ def run_briefing(
             schema=schema,
             schema_name="haymarket_page_briefing",
             max_output_tokens=BRIEFING_MAX_OUTPUT_TOKENS,
+            reasoning_effort=BRIEFING_REASONING_EFFORT,
         )
+        # Force speaker_directory IDs into canonical person_<slug> form so
+        # downstream stages (TEI <sp who>, person.id in tagging) share one
+        # vocabulary. The model's exact id choice doesn't matter — we
+        # rewrite from display_name.
+        normalize_speaker_directory(parsed)
         status = "success"
         error = None
     except Exception as exc:
@@ -118,10 +132,12 @@ def build_briefing_messages(page: dict[str, Any]) -> list[dict[str, str]]:
                 "(name/role or null), examiners (name + side e.g. prosecution/defense), "
                 "defendants_referenced, key_locations, key_dates, topics, and speaker_directory. "
                 "speaker_directory is a canonical map of every named speaker on this page (witness, "
-                "examiners, judge, defendants, etc.). Each entry has a speaker_id (kebab-case prefixed "
-                "with #, e.g. '#bonfield', '#mr_grinnell'), a display_name, and a role. Downstream "
-                "stages will use these IDs verbatim in TEI <sp who=\"...\"> attributes, so make them "
-                "stable and short.\n\n"
+                "examiners, judge, defendants, etc.). Each entry has a speaker_id, a display_name, "
+                "and a role. The pipeline normalizes speaker_id to a canonical person_<slug> form "
+                "based on display_name, so the speaker_id you provide is mostly informational — what "
+                "matters is the display_name being accurate (e.g. 'John Bonfield' or 'Mr. Grinnell'). "
+                "Downstream stages will use the canonical form as both the TEI <sp who=\"#…\"> "
+                "reference and the entity id when this speaker is extracted as a person.\n\n"
                 f"PAGE METADATA:\n{json.dumps(page.get('transcript_metadata', {}), ensure_ascii=False)}\n\n"
                 f"CANDIDATE PAGE TEXT:\n{candidate_text}"
             ),
@@ -131,3 +147,37 @@ def build_briefing_messages(page: dict[str, Any]) -> list[dict[str, str]]:
 
 def load_briefing_schema() -> dict[str, Any]:
     return load_schema_with_refs("briefing.schema.json")
+
+
+def normalize_speaker_directory(briefing: dict[str, Any] | None) -> None:
+    """Rewrite speaker_directory IDs into canonical person_<slug> form.
+
+    Stage A models tend to invent inconsistent ID styles ('#bonfield',
+    '#mr_grinnell', 'bonfield', 'BONFIELD'), and Stage C person records
+    must follow ^person_ per the schema. By overwriting the model's id
+    with slugify(display_name, 'person'), every stage uses the same
+    vocabulary: TEI <sp who="#person_john_bonfield">, person.id in
+    Stage C, harmonized people list. No translation step needed.
+    """
+    if not briefing:
+        return
+    directory = briefing.get("speaker_directory")
+    if not isinstance(directory, list):
+        return
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for entry in directory:
+        if not isinstance(entry, dict):
+            continue
+        display_name = entry.get("display_name")
+        if not display_name:
+            continue
+        canonical = slugify(str(display_name), "person")
+        entry["speaker_id"] = canonical
+        if canonical in seen:
+            # Two model entries collapsed to the same canonical id — drop
+            # the duplicate so downstream stages see one row per person.
+            continue
+        seen.add(canonical)
+        deduped.append(entry)
+    briefing["speaker_directory"] = deduped

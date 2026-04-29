@@ -55,7 +55,11 @@ MODEL_SLATES: dict[str, list[str]] = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Haymarket trial corpus pipeline")
     parser.add_argument("--user", default="local@example.com", help="User email for future S3 path compatibility")
-    parser.add_argument("--action", choices=["pull", "enrich", "geocode", "all"], default="all")
+    parser.add_argument(
+        "--action",
+        choices=["pull", "enrich", "geocode", "all", "cache-status"],
+        default="all",
+    )
     parser.add_argument("--corpus", choices=["test", "full"], default="test")
     parser.add_argument("--test", action="store_true", help="Shortcut for --corpus test")
     parser.add_argument("--source", choices=["hadc"], default="hadc")
@@ -88,8 +92,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--briefing-model",
-        default="gpt-4.1-mini",
-        help="Fixed model used for Stage A briefing (shared across model slate).",
+        default="gpt-5-mini",
+        help=(
+            "Fixed model used for Stage A briefing (shared across model slate). "
+            "Default gpt-5-mini: reasoning-class but cheaper than gpt-4.1-mini and "
+            "produces more consistent speaker_directory IDs/names than non-reasoning "
+            "models."
+        ),
     )
     parser.add_argument(
         "--tagging-model",
@@ -149,6 +158,21 @@ def parse_args() -> argparse.Namespace:
             "from the rows. JSONL is more robust against XML well-formedness mistakes."
         ),
     )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help=(
+            "Skip the page-level bundle cache. Default: cached bundles for pages with the same "
+            "config (models, prompts, source-text hash) are reused, and successful new bundles "
+            "are written to data/cache/haymarket/. Pass --no-cache to force every page to re-run "
+            "all three stages and not write back to the cache."
+        ),
+    )
+    parser.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help="Wipe data/cache/haymarket/ before running (separate from --clear-data).",
+    )
     parser.add_argument("--geocode", action="store_true", help="Run geolocation after enrichment")
     parser.add_argument("--geocoder", choices=["google"], default="google")
     parser.add_argument("--geocode-llm-model", default="gpt-4o-mini")
@@ -159,6 +183,39 @@ def parse_args() -> argparse.Namespace:
 
 def make_run_id() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def print_cache_status(data_dir: str) -> None:
+    from utils.page_cache import cache_inventory
+
+    inventory = cache_inventory(data_dir)
+    base = inventory["base_path"]
+    if inventory["total_pages"] == 0:
+        print(f"Cache empty ({base})")
+        return
+
+    print(f"Cache: {base}")
+    print(f"  {len(inventory['configs'])} config(s), {inventory['total_pages']} cached page(s), "
+          f"${inventory['total_cost_usd']:.4f} of producer cost")
+    for cfg in inventory["configs"]:
+        config = cfg["config"] or {}
+        config_summary = (
+            f"briefing={config.get('briefing_model', '?')}  "
+            f"transcription={config.get('transcription_model', '?')}/{config.get('transcription_format', '?')}  "
+            f"tagging={config.get('tagging_model', '?')}"
+        )
+        print(
+            f"\n  config {cfg['cache_key']}  "
+            f"({cfg['page_count']} page(s), ${cfg['cost_usd']:.4f})"
+        )
+        print(f"    {config_summary}")
+        for entry in cfg["pages"]:
+            produced = (entry.get("produced_at") or "")[:19].replace("T", " ")
+            run_label = entry.get("produced_by_run_id") or "?"
+            print(
+                f"    - {entry['page_id']:35s}  ${entry['cost_usd']:>7.4f}  "
+                f"{produced}  by {run_label}"
+            )
 
 
 def clear_generated_data(storage) -> dict[str, int]:
@@ -202,6 +259,12 @@ def main() -> None:
     print("=" * 72)
 
     try:
+        if args.clear_cache:
+            from utils.page_cache import clear_cache as clear_page_cache
+
+            cleared_count = clear_page_cache(storage)
+            print(f"Cleared page cache: {cleared_count} file(s) removed from cache/haymarket/")
+
         if args.clear_data:
             cleared = clear_generated_data(storage)
             total = sum(cleared.values())
@@ -209,6 +272,10 @@ def main() -> None:
             for prefix, count in cleared.items():
                 print(f"- {prefix}: {count} file(s)")
             print(f"Total cleared: {total} file(s)")
+
+        if args.action == "cache-status":
+            print_cache_status(args.data_dir)
+            return
 
         if args.action in {"pull", "all"}:
             pages = pull_corpus(args.corpus, storage, run_id)
@@ -229,6 +296,7 @@ def main() -> None:
                 page_filter=args.pages,
                 max_transcription_attempts=args.transcription_attempts,
                 transcription_format=args.transcription_format,
+                use_cache=not args.no_cache,
             )
             print(
                 "Enriched "
