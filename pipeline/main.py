@@ -154,6 +154,21 @@ def parse_args() -> argparse.Namespace:
             "from the rows. JSONL is more robust against XML well-formedness mistakes."
         ),
     )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help=(
+            "Skip the page-level bundle cache. Default: cached bundles for pages with the same "
+            "config (models, prompts, source-text hash) are reused, and successful new bundles "
+            "are written to data/cache/haymarket/. Pass --no-cache to force every page to re-run "
+            "all three stages and not write back to the cache."
+        ),
+    )
+    parser.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help="Wipe data/cache/haymarket/ before running (separate from --clear-data).",
+    )
     parser.add_argument("--geocode", action="store_true", help="Run geolocation after enrichment")
     parser.add_argument("--geocoder", choices=["google"], default="google")
     parser.add_argument("--geocode-llm-model", default="gpt-4o-mini")
@@ -207,6 +222,12 @@ def main() -> None:
     print("=" * 72)
 
     try:
+        if args.clear_cache:
+            from utils.page_cache import clear_cache as clear_page_cache
+
+            cleared_count = clear_page_cache(storage)
+            print(f"Cleared page cache: {cleared_count} file(s) removed from cache/haymarket/")
+
         if args.clear_data:
             cleared = clear_generated_data(storage)
             total = sum(cleared.values())
@@ -234,6 +255,7 @@ def main() -> None:
                 page_filter=args.pages,
                 max_transcription_attempts=args.transcription_attempts,
                 transcription_format=args.transcription_format,
+                use_cache=not args.no_cache,
             )
             print(
                 "Enriched "

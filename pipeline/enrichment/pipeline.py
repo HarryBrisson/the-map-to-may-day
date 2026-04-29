@@ -24,6 +24,7 @@ def run_enrichment(
     page_filter: list[str] | None = None,
     max_transcription_attempts: int = 2,
     transcription_format: str = "tei",
+    use_cache: bool = True,
 ) -> dict[str, list[dict[str, Any]]]:
     pages = load_pages(storage, run_id)
     if page_filter:
@@ -45,14 +46,19 @@ def run_enrichment(
         streaming=streaming,
         max_transcription_attempts=max_transcription_attempts,
         transcription_format=transcription_format,
+        use_cache=use_cache,
     )
     failed_calls = [record for record in extraction["audit_records"] if record["status"] == "error"]
-    successful_calls = [record for record in extraction["audit_records"] if record["status"] == "success"]
+    successful_calls = [
+        record for record in extraction["audit_records"] if record["status"] in ("success", "cached")
+    ]
+    cached_calls = [record for record in extraction["audit_records"] if record["status"] == "cached"]
     if failed_calls:
         print(f"LLM extraction errors: {len(failed_calls)} of {len(extraction['audit_records'])} calls failed")
         for record in failed_calls[:3]:
             print(f"- {record['call_id']}: {record['error']}")
-    print(f"LLM extraction successes: {len(successful_calls)} of {len(extraction['audit_records'])} calls")
+    cache_note = f" ({len(cached_calls)} from cache)" if cached_calls else ""
+    print(f"LLM extraction successes: {len(successful_calls)} of {len(extraction['audit_records'])} calls{cache_note}")
     print_model_eval(extraction["model_eval"])
     print_cost_summary(extraction["cost_summary"])
     if not successful_calls:

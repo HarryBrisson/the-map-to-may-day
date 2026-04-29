@@ -4,10 +4,19 @@ from datetime import datetime, timezone
 from typing import Any
 
 from enrichment.progress import StageProgress
-from enrichment.stage_briefing import run_briefing
-from enrichment.stage_tagging import DEFAULT_MAX_WORKERS, run_tagging
-from enrichment.stage_transcription import run_transcription
+from enrichment.stage_briefing import BRIEFING_PROMPT_TEMPLATE, run_briefing
+from enrichment.stage_tagging import DEFAULT_MAX_WORKERS, TAGGING_PROMPT_TEMPLATE, run_tagging
+from enrichment.stage_transcription import (
+    TRANSCRIPTION_JSONL_PROMPT_TEMPLATE,
+    TRANSCRIPTION_PROMPT_TEMPLATE,
+    run_transcription,
+)
 from utils.openai_schema import LLMCallError, MODEL_PRICING_PER_1M, estimate_cost_usd
+from utils.page_cache import (
+    compute_cache_key,
+    read_cached_bundle,
+    write_cached_bundle,
+)
 
 
 DEFAULT_BRIEFING_MODEL = "gpt-5-mini"
@@ -26,6 +35,7 @@ def extract_pages_with_audit(
     streaming: bool = True,
     max_transcription_attempts: int = 2,
     transcription_format: str = "tei",
+    use_cache: bool = True,
 ) -> dict[str, Any]:
     if provider != "openai":
         raise ValueError(f"Unsupported LLM provider: {provider}")
@@ -41,7 +51,47 @@ def extract_pages_with_audit(
     for page in skipped:
         print(f"Skipping LLM extraction for {page['id']} (source_type=toc)")
 
+    # Compute per-page cache keys upfront so we know which pages can skip
+    # all three stages entirely. Briefing is keyed only by page+briefing
+    # config, not the slate model — so we share one cache check across
+    # all model-slate iterations.
+    pages_needing_briefing: list[dict[str, Any]] = []
+    page_cache_keys: dict[tuple[str, str], str] = {}
     for page in extraction_pages:
+        for model in models:
+            cache_key = compute_cache_key(
+                page,
+                briefing_model=briefing_model,
+                transcription_model=model,
+                transcription_format=transcription_format,
+                tagging_model=tagging_model or model,
+                briefing_prompt_template=BRIEFING_PROMPT_TEMPLATE,
+                transcription_prompt_template=(
+                    TRANSCRIPTION_JSONL_PROMPT_TEMPLATE
+                    if transcription_format == "jsonl"
+                    else TRANSCRIPTION_PROMPT_TEMPLATE
+                ),
+                tagging_prompt_template=TAGGING_PROMPT_TEMPLATE,
+            )
+            page_cache_keys[(page["id"], model)] = cache_key
+
+    # Briefing only needs to run for pages where AT LEAST ONE model's
+    # cache misses. If every model has a cached bundle for this page,
+    # the briefing is unused.
+    def page_fully_cached(page_id: str) -> bool:
+        if not use_cache:
+            return False
+        return all(
+            read_cached_bundle(storage, page_cache_keys[(page_id, model)], page_id) is not None
+            for model in models
+        )
+
+    for page in extraction_pages:
+        if page_fully_cached(page["id"]):
+            continue
+        pages_needing_briefing.append(page)
+
+    for page in pages_needing_briefing:
         progress = StageProgress(page["id"], "briefing", enabled=streaming)
         result = run_briefing(
             page=page,
@@ -56,6 +106,25 @@ def extract_pages_with_audit(
 
     for model in models:
         for page in extraction_pages:
+            cache_key = page_cache_keys[(page["id"], model)]
+            cache_hit = read_cached_bundle(storage, cache_key, page["id"]) if use_cache else None
+
+            if cache_hit is not None:
+                cached_bundle, cached_metadata = cache_hit
+                bundles_by_model[model].append(cached_bundle)
+                StageProgress(page["id"], "cache", enabled=streaming).info(
+                    f"hit ({cache_key[:8]}, saved ${cached_metadata.get('cost_usd', 0):.4f})"
+                )
+                audit_records.append(
+                    build_cached_audit_record(
+                        page=page,
+                        model=model,
+                        cache_key=cache_key,
+                        cached_metadata=cached_metadata,
+                    )
+                )
+                continue
+
             briefing = briefings.get(page["id"])
             briefing_result = briefing_results.get(page["id"], _empty_briefing_result())
 
@@ -90,16 +159,34 @@ def extract_pages_with_audit(
                 bundle["tei_validation"] = transcription.get("validation")
                 bundles_by_model[model].append(bundle)
 
-            audit_records.append(
-                build_combined_audit_record(
-                    page=page,
-                    model=model,
-                    briefing_result=briefing_result,
-                    transcription=transcription,
-                    tagging=tagging,
-                    bundle=bundle,
-                )
+            audit_record = build_combined_audit_record(
+                page=page,
+                model=model,
+                briefing_result=briefing_result,
+                transcription=transcription,
+                tagging=tagging,
+                bundle=bundle,
             )
+            audit_records.append(audit_record)
+
+            # Write to cache only on full success — partial bundles aren't
+            # safe to reuse.
+            if use_cache and bundle is not None and audit_record["status"] == "success":
+                write_cached_bundle(
+                    storage,
+                    cache_key,
+                    page["id"],
+                    bundle,
+                    run_id=run_id,
+                    config={
+                        "briefing_model": briefing_model,
+                        "transcription_model": model,
+                        "transcription_format": transcription_format,
+                        "tagging_model": tagging_model or model,
+                    },
+                    cost_usd=audit_record["cost_usd"],
+                    usage=audit_record["usage"],
+                )
 
     cost_summary = build_cost_summary(run_id, audit_records)
     model_eval = build_model_eval(run_id, bundles_by_model, audit_records)
@@ -187,6 +274,45 @@ def build_combined_audit_record(
         "cost_usd": round(sum(stage_costs.values()), 8),
         "status": status,
         "error": error,
+    }
+
+
+def build_cached_audit_record(
+    page: dict[str, Any],
+    model: str,
+    cache_key: str,
+    cached_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    """Audit record for a page served from cache.
+
+    The cost shown for THIS run is zero — we didn't pay anything. The
+    cached_metadata.cost_usd shows what the cache producer originally
+    spent (purely informational, available in audit JSON).
+    """
+    return {
+        "run_id": None,
+        "call_id": f"{page['id']}_{_slug(model)}",
+        "page_id": page["id"],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "provider": "openai",
+        "model": model,
+        "cache_key": cache_key,
+        "cached_from_run_id": cached_metadata.get("produced_by_run_id"),
+        "cached_original_cost_usd": cached_metadata.get("cost_usd", 0.0),
+        "stage_paths": {},
+        "stage_costs": {"briefing": 0.0, "transcription": 0.0, "tagging": 0.0},
+        "stage_usage": {
+            "briefing": _zero_usage(),
+            "transcription": _zero_usage(),
+            "tagging": _zero_usage(),
+        },
+        "tei_validation": None,
+        "tagging_summary": {"unit_count": 0, "success_count": 0, "error_count": 0},
+        "source_urls": [page["url"]],
+        "usage": _zero_usage(),
+        "cost_usd": 0.0,
+        "status": "cached",
+        "error": None,
     }
 
 
@@ -300,7 +426,9 @@ def build_model_eval(
     models = []
     for model, bundles in bundles_by_model.items():
         records = [record for record in audit_records if record["model"] == model]
-        successful = [record for record in records if record["status"] == "success"]
+        # Cached bundles count as successful — they were produced by a
+        # prior successful run and are equivalent to running the stages.
+        successful = [record for record in records if record["status"] in ("success", "cached")]
         cost = round(sum(record["cost_usd"] for record in records), 8)
         missing = collect_missing_required_fields(bundles)
         models.append(

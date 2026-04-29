@@ -50,6 +50,85 @@ def test_briefing_schema_matches_strict_response_format_subset() -> None:
     assert_openai_strict_schema(schema)
 
 
+def test_page_cache_hit_skips_all_three_stages(tmp_path, monkeypatch) -> None:
+    """Two-pass test: first run populates cache, second run reads from it."""
+    from utils.page_cache import compute_cache_key, write_cached_bundle, read_cached_bundle
+
+    storage = LocalJsonStorage(tmp_path)
+    page = {
+        "id": "source_hadc_test",
+        "candidate_text_sha256": "sha-of-text",
+        "url": "https://example.test/test.htm",
+    }
+    cache_key = compute_cache_key(
+        page,
+        briefing_model="gpt-5-mini",
+        transcription_model="gpt-5.5",
+        transcription_format="jsonl",
+        tagging_model="gpt-5-mini",
+        briefing_prompt_template="b_v1",
+        transcription_prompt_template="t_v1",
+        tagging_prompt_template="c_v1",
+    )
+
+    # Cache miss before any writes
+    assert read_cached_bundle(storage, cache_key, page["id"]) is None
+
+    bundle = {"source_id": page["id"], "tei_xml": "<TEI/>", "people": [], "locations": [],
+              "claims": [], "event_suggestions": [], "quotes": []}
+    write_cached_bundle(
+        storage,
+        cache_key,
+        page["id"],
+        bundle,
+        run_id="prior_run",
+        config={"briefing_model": "gpt-5-mini"},
+        cost_usd=1.50,
+        usage={"input_tokens": 100, "output_tokens": 50, "total_tokens": 150,
+               "reasoning_tokens": 0, "cached_input_tokens": 0},
+    )
+
+    # Cache hit after write
+    cached = read_cached_bundle(storage, cache_key, page["id"])
+    assert cached is not None
+    cached_bundle, cached_metadata = cached
+    assert cached_bundle == bundle
+    assert cached_metadata["produced_by_run_id"] == "prior_run"
+    assert cached_metadata["cost_usd"] == 1.50
+
+
+def test_compute_cache_key_changes_when_config_changes() -> None:
+    from utils.page_cache import compute_cache_key
+
+    page = {"id": "p", "candidate_text_sha256": "abc"}
+    base_args = dict(
+        briefing_model="gpt-5-mini",
+        transcription_model="gpt-5.5",
+        transcription_format="jsonl",
+        tagging_model="gpt-5-mini",
+        briefing_prompt_template="b_v1",
+        transcription_prompt_template="t_v1",
+        tagging_prompt_template="c_v1",
+    )
+    baseline = compute_cache_key(page, **base_args)
+
+    # Bumping a prompt version invalidates the key
+    bumped_prompt = compute_cache_key(page, **{**base_args, "tagging_prompt_template": "c_v2"})
+    assert bumped_prompt != baseline
+
+    # Switching models invalidates the key
+    swapped_model = compute_cache_key(page, **{**base_args, "transcription_model": "gpt-5.4"})
+    assert swapped_model != baseline
+
+    # Source text change invalidates the key
+    different_source = compute_cache_key({"id": "p", "candidate_text_sha256": "def"}, **base_args)
+    assert different_source != baseline
+
+    # Same inputs reproduce the same key
+    again = compute_cache_key(page, **base_args)
+    assert again == baseline
+
+
 def test_normalize_speaker_directory_canonicalizes_ids_to_person_slug() -> None:
     from enrichment.stage_briefing import normalize_speaker_directory
 
