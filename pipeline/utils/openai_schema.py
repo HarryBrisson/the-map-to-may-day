@@ -127,14 +127,7 @@ def call_openai_text(
 
     response = client.responses.create(**request)
     raw_output = response.model_dump(mode="json")
-    usage_obj = raw_output.get("usage") or {}
-    input_tokens = usage_obj.get("input_tokens") or usage_obj.get("prompt_tokens") or 0
-    output_tokens = usage_obj.get("output_tokens") or usage_obj.get("completion_tokens") or 0
-    usage = {
-        "input_tokens": int(input_tokens),
-        "output_tokens": int(output_tokens),
-        "total_tokens": int(usage_obj.get("total_tokens") or input_tokens + output_tokens),
-    }
+    usage = _extract_usage(raw_output)
     return response.output_text, raw_output, usage
 
 
@@ -168,19 +161,37 @@ def call_openai_structured(
 
     response = client.responses.create(**request)
     raw_output = response.model_dump(mode="json")
-    usage_obj = raw_output.get("usage") or {}
-    input_tokens = usage_obj.get("input_tokens") or usage_obj.get("prompt_tokens") or 0
-    output_tokens = usage_obj.get("output_tokens") or usage_obj.get("completion_tokens") or 0
-    usage = {
-        "input_tokens": int(input_tokens),
-        "output_tokens": int(output_tokens),
-        "total_tokens": int(usage_obj.get("total_tokens") or input_tokens + output_tokens),
-    }
+    usage = _extract_usage(raw_output)
     try:
         parsed = json.loads(response.output_text)
     except Exception as exc:
         raise LLMCallError("OpenAI returned output that could not be parsed as JSON", raw_output, usage) from exc
     return parsed, raw_output, usage
+
+
+def _extract_usage(raw_output: dict[str, Any]) -> dict[str, int]:
+    """Pull token counts from a Responses API response.
+
+    OpenAI's `output_tokens` already includes reasoning tokens (and they
+    bill at the regular output rate), so cost is correct without further
+    adjustment. We pull `output_tokens_details.reasoning_tokens` out
+    separately for visibility — it lets us see whether reasoning_effort
+    is being honored and how much of the answer budget reasoning ate.
+    """
+    usage_obj = raw_output.get("usage") or {}
+    input_tokens = usage_obj.get("input_tokens") or usage_obj.get("prompt_tokens") or 0
+    output_tokens = usage_obj.get("output_tokens") or usage_obj.get("completion_tokens") or 0
+    output_details = usage_obj.get("output_tokens_details") or {}
+    input_details = usage_obj.get("input_tokens_details") or {}
+    reasoning_tokens = output_details.get("reasoning_tokens") or 0
+    cached_tokens = input_details.get("cached_tokens") or 0
+    return {
+        "input_tokens": int(input_tokens),
+        "output_tokens": int(output_tokens),
+        "total_tokens": int(usage_obj.get("total_tokens") or input_tokens + output_tokens),
+        "reasoning_tokens": int(reasoning_tokens),
+        "cached_input_tokens": int(cached_tokens),
+    }
 
 
 MODEL_PRICING_PER_1M = {

@@ -132,18 +132,24 @@ def run_enrichment(
 
 def print_cost_summary(cost_summary: dict[str, Any]) -> None:
     totals = cost_summary.get("totals", {})
+    reasoning = totals.get("reasoning_tokens", 0)
+    reasoning_suffix = f", {reasoning} reasoning" if reasoning else ""
     print(
         "LLM cost: "
         f"${totals.get('cost_usd', 0):.6f} total across {totals.get('calls', 0)} calls "
-        f"({totals.get('input_tokens', 0)} input + {totals.get('output_tokens', 0)} output tokens)"
+        f"({totals.get('input_tokens', 0)} input + {totals.get('output_tokens', 0)} "
+        f"output tokens{reasoning_suffix})"
     )
     for model, values in cost_summary.get("by_model", {}).items():
         print(f"  {model}: ${values.get('cost_usd', 0):.6f} ({values.get('calls', 0)} calls)")
     for stage, values in cost_summary.get("by_stage", {}).items():
+        stage_reasoning = values.get("reasoning_tokens", 0)
+        stage_reasoning_suffix = f", {stage_reasoning} reasoning" if stage_reasoning else ""
         print(
             f"  stage {stage}: ${values.get('cost_usd', 0):.6f} "
             f"({values.get('calls', 0)} calls, "
-            f"{values.get('input_tokens', 0)} input + {values.get('output_tokens', 0)} output tokens)"
+            f"{values.get('input_tokens', 0)} input + {values.get('output_tokens', 0)} "
+            f"output tokens{stage_reasoning_suffix})"
         )
 
 

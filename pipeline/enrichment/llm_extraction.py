@@ -118,7 +118,7 @@ def _empty_briefing_result() -> dict[str, Any]:
     return {
         "briefing": None,
         "audit": None,
-        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        "usage": _zero_usage(),
         "cost_usd": 0.0,
         "status": "skipped",
         "error": None,
@@ -149,6 +149,8 @@ def build_combined_audit_record(
         aggregate_usage["input_tokens"] += usage.get("input_tokens", 0)
         aggregate_usage["output_tokens"] += usage.get("output_tokens", 0)
         aggregate_usage["total_tokens"] += usage.get("total_tokens", 0)
+        aggregate_usage["reasoning_tokens"] += usage.get("reasoning_tokens", 0)
+        aggregate_usage["cached_input_tokens"] += usage.get("cached_input_tokens", 0)
 
     if transcription["status"] != "success":
         status = "error"
@@ -200,7 +202,13 @@ def _summarize_tagging(tagging: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def _zero_usage() -> dict[str, int]:
-    return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    return {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cached_input_tokens": 0,
+    }
 
 
 def _slug(value: str) -> str:
@@ -222,31 +230,19 @@ def build_cost_summary(run_id: str, audit_records: list[dict[str, Any]]) -> dict
     for record in audit_records:
         usage = record["usage"]
         model = record["model"]
-        totals["calls"] += 1
-        totals["input_tokens"] += usage["input_tokens"]
-        totals["output_tokens"] += usage["output_tokens"]
-        totals["total_tokens"] += usage["total_tokens"]
-        totals["cost_usd"] += record["cost_usd"]
+        _accumulate_bucket(totals, usage, record["cost_usd"])
 
         model_totals = by_model.setdefault(model, _zero_cost_bucket())
-        model_totals["calls"] += 1
-        model_totals["input_tokens"] += usage["input_tokens"]
-        model_totals["output_tokens"] += usage["output_tokens"]
-        model_totals["total_tokens"] += usage["total_tokens"]
-        model_totals["cost_usd"] += record["cost_usd"]
+        _accumulate_bucket(model_totals, usage, record["cost_usd"])
 
         stage_costs = record.get("stage_costs", {})
         stage_usage = record.get("stage_usage", {})
         for stage, bucket in by_stage.items():
             stage_cost = float(stage_costs.get(stage) or 0.0)
             stage_use = stage_usage.get(stage) or _zero_usage()
-            if stage_cost == 0 and stage_use["total_tokens"] == 0:
+            if stage_cost == 0 and stage_use.get("total_tokens", 0) == 0:
                 continue
-            bucket["calls"] += 1
-            bucket["input_tokens"] += stage_use["input_tokens"]
-            bucket["output_tokens"] += stage_use["output_tokens"]
-            bucket["total_tokens"] += stage_use["total_tokens"]
-            bucket["cost_usd"] += stage_cost
+            _accumulate_bucket(bucket, stage_use, stage_cost)
 
         calls.append(
             {
@@ -275,7 +271,25 @@ def build_cost_summary(run_id: str, audit_records: list[dict[str, Any]]) -> dict
 
 
 def _zero_cost_bucket() -> dict[str, Any]:
-    return {"calls": 0, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0}
+    return {
+        "calls": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cached_input_tokens": 0,
+        "cost_usd": 0.0,
+    }
+
+
+def _accumulate_bucket(bucket: dict[str, Any], usage: dict[str, Any], cost_usd: float) -> None:
+    bucket["calls"] += 1
+    bucket["input_tokens"] += usage.get("input_tokens", 0)
+    bucket["output_tokens"] += usage.get("output_tokens", 0)
+    bucket["total_tokens"] += usage.get("total_tokens", 0)
+    bucket["reasoning_tokens"] += usage.get("reasoning_tokens", 0)
+    bucket["cached_input_tokens"] += usage.get("cached_input_tokens", 0)
+    bucket["cost_usd"] += cost_usd
 
 
 def build_model_eval(
