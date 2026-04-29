@@ -9,3 +9,4 @@ data/
 .venv/
 venv/
 data.bak/
+.claude/
