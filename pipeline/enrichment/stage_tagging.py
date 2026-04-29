@@ -24,7 +24,15 @@ from utils.s3_storage import JsonStorage
 
 
 TAGGING_PROMPT_TEMPLATE = "haymarket_segment_tagging_v1"
-TAGGING_MAX_OUTPUT_TOKENS = 1_500
+# Bumped from 1.5k to 8k so reasoning models (gpt-5 family) have room for
+# both reasoning tokens AND a verbose JSON answer on long Bonfield-style
+# turns. The audit showed pre-bump failures consistently hitting a 4500
+# token boundary and truncating mid-string.
+TAGGING_MAX_OUTPUT_TOKENS = 8_000
+# Reasoning is wasted budget on this task — pattern-match for entities
+# in one segment given a briefing, no chain-of-thought needed. Setting
+# to "minimal" tells gpt-5 models to skip reasoning and emit the answer.
+TAGGING_REASONING_EFFORT = "minimal"
 PRIOR_UNIT_CONTEXT = 3
 DEFAULT_MAX_WORKERS = 8
 DEFAULT_UNIT_ATTEMPTS = 3
@@ -239,6 +247,7 @@ def tag_one_unit(
             schema=schema,
             schema_name="haymarket_segment_tags",
             max_output_tokens=TAGGING_MAX_OUTPUT_TOKENS,
+            reasoning_effort=TAGGING_REASONING_EFFORT,
         )
         cost_usd = estimate_cost_usd(model, usage)
         return {

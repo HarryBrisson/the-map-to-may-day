@@ -87,6 +87,14 @@ run_experiment "exp_55jsonl_5minitag" \
     --transcription-format jsonl \
     --tagging-model gpt-5-mini
 
+# --- gpt-5.4: half the price of gpt-5.5. Does it pass Stage B at 0.95? ---
+# 5.4 is $2.50/$15 vs 5.5's $5/$30. If it can transcribe at >=0.95
+# token_recall it's a no-brainer cost cut.
+run_experiment "exp_54jsonl_5minitag" \
+    --llm-model gpt-5.4 \
+    --transcription-format jsonl \
+    --tagging-model gpt-5-mini
+
 # --- Flagship-only: ~$13. Reproduces the earlier known-good configuration. ---
 # Comment back in if you want to re-baseline; otherwise skip.
 # run_experiment "exp_55tei_55tag" \

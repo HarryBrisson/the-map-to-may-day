@@ -100,8 +100,8 @@ def test_tag_one_unit_with_retry_recovers_from_first_failure(monkeypatch) -> Non
 
     calls = {"count": 0}
 
-    def fake_call_openai_structured(model, input_messages, schema, schema_name, max_output_tokens=None):
-        del model, input_messages, schema, schema_name, max_output_tokens
+    def fake_call_openai_structured(model, input_messages, schema, schema_name, max_output_tokens=None, reasoning_effort=None):
+        del model, input_messages, schema, schema_name, max_output_tokens, reasoning_effort
         calls["count"] += 1
         if calls["count"] == 1:
             raise stage_tagging.LLMCallError(
@@ -411,16 +411,16 @@ def test_run_enrichment_writes_app_ready_outputs(tmp_path, monkeypatch) -> None:
     }
     usage = {"input_tokens": 100, "output_tokens": 100, "total_tokens": 200}
 
-    def structured_response(model, input_messages, schema, schema_name, max_output_tokens=None):
-        del model, input_messages, schema, max_output_tokens
+    def structured_response(model, input_messages, schema, schema_name, max_output_tokens=None, reasoning_effort=None):
+        del model, input_messages, schema, max_output_tokens, reasoning_effort
         if schema_name == "haymarket_page_briefing":
             return briefing, {"output": "structured"}, usage
         if schema_name == "haymarket_segment_tags":
             return tagging_payload, {"output": "structured"}, usage
         raise AssertionError(f"unexpected schema_name: {schema_name}")
 
-    def text_response(model, input_messages, max_output_tokens=None):
-        del model, input_messages, max_output_tokens
+    def text_response(model, input_messages, max_output_tokens=None, reasoning_effort=None):
+        del model, input_messages, max_output_tokens, reasoning_effort
         return transcription_tei, {"output": "text"}, usage
 
     monkeypatch.setattr(stage_briefing, "call_openai_structured", structured_response)

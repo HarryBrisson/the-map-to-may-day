@@ -331,14 +331,34 @@ def write_harmonized_transcripts(storage: JsonStorage, pages: list[dict[str, Any
         if not bundle or not bundle.get("tei_xml") or not tei_path or not transcript_path:
             continue
 
-        storage.write_text(tei_path, bundle["tei_xml"], "application/tei+xml; charset=utf-8")
-        transcript_index = tei_to_transcript_json(
+        # First pass: render the bundle TEI to extract plain text so we can
+        # locate every mention of an entity's display_name / alternate_names
+        # in the transcript.
+        base_transcript = tei_to_transcript_json(
             source_id=page["id"],
             url=page["url"],
             title=page["title"],
             source_type=page["source_type"],
             fetched_at=page["fetched_at"],
             tei_xml=bundle["tei_xml"],
+            transcript_metadata=page.get("transcript_metadata", {}),
+        )
+        # Find literal mentions in the text and add them as standoff
+        # annotations on the TEI. Without this the app sees segments and
+        # speaker attribution but no entity-to-text linkage.
+        mentions = build_annotation_mentions(base_transcript["text"], bundle)
+        annotated_tei = add_standoff_annotations_to_tei(bundle["tei_xml"], mentions)
+        storage.write_text(tei_path, annotated_tei, "application/tei+xml; charset=utf-8")
+
+        # Second pass: re-render the transcript index from the annotated TEI
+        # so the published transcript JSON includes the inline mentions.
+        transcript_index = tei_to_transcript_json(
+            source_id=page["id"],
+            url=page["url"],
+            title=page["title"],
+            source_type=page["source_type"],
+            fetched_at=page["fetched_at"],
+            tei_xml=annotated_tei,
             transcript_metadata=page.get("transcript_metadata", {}),
         )
         storage.write_json(transcript_path, transcript_index)

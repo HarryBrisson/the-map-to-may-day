@@ -92,14 +92,27 @@ def normalize_openai_schema(schema: Any) -> None:
             normalize_openai_schema(value)
 
 
+REASONING_MODEL_PREFIXES = ("gpt-5", "o1", "o3", "o4")
+
+
+def is_reasoning_model(model: str) -> bool:
+    return any(model.startswith(prefix) for prefix in REASONING_MODEL_PREFIXES)
+
+
 def call_openai_text(
     model: str,
     input_messages: list[dict[str, str]],
     max_output_tokens: int | None = None,
+    reasoning_effort: str | None = None,
 ) -> tuple[str, Any, dict[str, int]]:
     """Plain-text completion. Use when the response is not naturally JSON
     (e.g. raw TEI XML) — avoids the JSON-string-escape token tax that
-    structured outputs impose."""
+    structured outputs impose.
+
+    reasoning_effort applies only to reasoning models (gpt-5 family,
+    o-series). Pass "minimal" / "low" / "medium" / "high" to control how
+    many output tokens go to reasoning before the answer is emitted.
+    """
     from openai import OpenAI
 
     client = OpenAI()
@@ -109,6 +122,8 @@ def call_openai_text(
     }
     if max_output_tokens is not None:
         request["max_output_tokens"] = max_output_tokens
+    if reasoning_effort and is_reasoning_model(model):
+        request["reasoning"] = {"effort": reasoning_effort}
 
     response = client.responses.create(**request)
     raw_output = response.model_dump(mode="json")
@@ -129,6 +144,7 @@ def call_openai_structured(
     schema: dict[str, Any],
     schema_name: str,
     max_output_tokens: int | None = None,
+    reasoning_effort: str | None = None,
 ) -> tuple[dict[str, Any], Any, dict[str, int]]:
     from openai import OpenAI
 
@@ -147,6 +163,8 @@ def call_openai_structured(
     }
     if max_output_tokens is not None:
         request["max_output_tokens"] = max_output_tokens
+    if reasoning_effort and is_reasoning_model(model):
+        request["reasoning"] = {"effort": reasoning_effort}
 
     response = client.responses.create(**request)
     raw_output = response.model_dump(mode="json")
