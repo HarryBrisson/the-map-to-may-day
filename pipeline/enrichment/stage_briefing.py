@@ -16,7 +16,7 @@ from utils.openai_schema import (
 from utils.s3_storage import JsonStorage
 
 
-BRIEFING_PROMPT_TEMPLATE = "haymarket_page_briefing_v1"
+BRIEFING_PROMPT_TEMPLATE = "haymarket_page_briefing_v2"
 # Bumped from 2k to 8k so reasoning models (gpt-5 family) have room for both
 # reasoning tokens and the structured answer. Briefing identifying every
 # speaker on a long page benefits from reasoning, but the budget needs
@@ -128,9 +128,23 @@ def build_briefing_messages(page: dict[str, Any]) -> list[dict[str, str]]:
                 f"URL: {page['url']}\n"
                 f"Title: {page['title']}\n"
                 f"Type: {page['source_type']}\n\n"
-                "Return a JSON briefing with: source_id, summary (2-4 sentences), witness "
-                "(name/role or null), examiners (name + side e.g. prosecution/defense), "
-                "defendants_referenced, key_locations, key_dates, topics, and speaker_directory. "
+                "Return a JSON briefing with: source_id, summary (2-4 sentences), brief_title "
+                "(short display title), navigation_summary (1-2 sentences for a source card), "
+                "document_date, document_order, document_role, witness (name/role or null), "
+                "examiners (name + side e.g. prosecution/defense), defendants_referenced, "
+                "key_locations, key_dates, concise facetable topics, primary_people, "
+                "primary_locations, referenced_events, and speaker_directory. "
+                "document_date.normalized_date should be ISO YYYY-MM-DD when the source creation, "
+                "testimony, exhibit, or procedural date is clear; otherwise null with original_text "
+                "preserved. document_order should capture trial volume and page range when present. "
+                "document_role must be one of testimony, exhibit, procedural, toc, cover, "
+                "legal_document, other. primary_people and primary_locations are the most useful "
+                "navigation entities for this document; set canonical_id only when the page itself "
+                "clearly supports a stable person_/location_ id, otherwise null. referenced_events "
+                "are historical events discussed by this document, not merely the fact that this "
+                "document exists; include event_time, place, participants, a short summary, page_refs, "
+                "and a short source-grounded supporting_quote when available. Set referenced_events "
+                "canonical_id only when the page clearly reuses an existing event_ id, otherwise null. "
                 "speaker_directory is a canonical map of every named speaker on this page (witness, "
                 "examiners, judge, defendants, etc.). Each entry has a speaker_id, a display_name, "
                 "and a role. The pipeline normalizes speaker_id to a canonical person_<slug> form "

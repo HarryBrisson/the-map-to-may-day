@@ -156,6 +156,8 @@ def extract_pages_with_audit(
                     max_unit_attempts=max_tagging_unit_attempts,
                 )
                 bundle = tagging["bundle"]
+                if briefing:
+                    bundle["briefing"] = briefing
                 bundle["tei_validation"] = transcription.get("validation")
                 bundles_by_model[model].append(bundle)
 

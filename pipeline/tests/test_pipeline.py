@@ -437,12 +437,43 @@ def test_run_enrichment_writes_app_ready_outputs(tmp_path, monkeypatch) -> None:
     briefing = {
         "source_id": source_id,
         "summary": "Bonfield testifies about Desplaines Street Station.",
+        "brief_title": "Bonfield testimony",
+        "navigation_summary": "Bonfield describes police movement through Desplaines Street Station.",
+        "document_date": {"original_text": "1886 July 16", "normalized_date": "1886-07-16", "precision": "day"},
+        "document_order": {"volume": "I", "page_start": 19, "page_end": 52, "sequence_label": "19-52"},
+        "document_role": "testimony",
         "witness": {"name": "John Bonfield", "role": "police"},
         "examiners": [],
         "defendants_referenced": [],
         "key_locations": ["Desplaines Street Station"],
         "key_dates": [],
         "topics": ["police movement"],
+        "primary_people": [
+            {"label": "John Bonfield", "canonical_id": None, "role_or_relationship": "witness", "confidence": 0.95},
+        ],
+        "primary_locations": [
+            {"label": "Desplaines Street Station", "canonical_id": None, "role_or_relationship": "police rendezvous", "confidence": 0.9},
+        ],
+        "referenced_events": [
+            {
+                "label": "Police rendezvous at Desplaines Street Station",
+                "canonical_id": None,
+                "event_time": {
+                    "start": "1886-05-04T18:00:00",
+                    "end": None,
+                    "precision": "approximate",
+                    "original_text": "in the vicinity of six o'clock",
+                },
+                "location_label": "Desplaines Street Station",
+                "location_id": None,
+                "participant_labels": ["John Bonfield"],
+                "participant_person_ids": [],
+                "summary": "Bonfield says police gathered at the station before moving toward Haymarket.",
+                "supporting_quote": "in the vicinity of six o'clock",
+                "page_refs": ["19"],
+                "confidence": 0.88,
+            }
+        ],
         "speaker_directory": [
             {"speaker_id": "#bonfield", "display_name": "John Bonfield", "role": "witness"},
         ],
@@ -573,6 +604,10 @@ def test_run_enrichment_writes_app_ready_outputs(tmp_path, monkeypatch) -> None:
     assert any(mention["entity_id"] == "person_john_bonfield" for mention in transcript["mentions"])
     assert any(mention["entity_id"] == "location_desplaines_street_station" for mention in transcript["mentions"])
     assert result["quotes"][0]["speaker_person_id"] == "person_john_bonfield"
+    source = storage.read_json("enriched/haymarket/sources/latest.json")[0]
+    assert source["navigation"]["document_date"]["normalized_date"] == "1886-07-16"
+    assert source["navigation"]["primary_people"][0]["canonical_id"] == "person_john_bonfield"
+    assert source["navigation"]["referenced_events"][0]["canonical_id"] == "event_police_rendezvous_at_desplaines_street_station_1886_05_04t18_00_00_location_desplaines_station"
 
 
 def test_claims_are_not_promoted_to_events_without_event_suggestions() -> None:

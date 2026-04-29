@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -73,7 +74,7 @@ def run_enrichment(
     claims = enrich_claims_with_source(harmonized["claims"], pages)
     events = [event for event in harmonized["events"] if is_historical_event(event)]
     quotes = harmonized["quotes"]
-    sources = source_summaries(pages)
+    sources = source_summaries(pages, harmonized["bundles"])
     transcript_summary = write_harmonized_transcripts(storage, pages, harmonized["bundles"])
     print(
         "Harmonized "
@@ -317,7 +318,8 @@ def strip_claim_app_fields(claim: dict[str, Any]) -> dict[str, Any]:
     return schema_claim
 
 
-def source_summaries(pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def source_summaries(pages: list[dict[str, Any]], bundles: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    bundles_by_source = {bundle.get("source_id"): bundle for bundle in bundles or [] if bundle.get("source_id")}
     return [
         {
             "id": page["id"],
@@ -325,12 +327,288 @@ def source_summaries(pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "title": page["title"],
             "source_type": page["source_type"],
             "transcript_metadata": page.get("transcript_metadata", {}),
+            "source_stats": page.get("source_stats", {}),
             "candidate_text_path": page.get("candidate_text_path"),
             "tei_path": page.get("tei_path"),
             "transcript_json_path": page.get("transcript_json_path"),
+            "navigation": build_source_navigation(page, bundles_by_source.get(page["id"])),
         }
         for page in pages
     ]
+
+
+def build_source_navigation(page: dict[str, Any], bundle: dict[str, Any] | None = None) -> dict[str, Any]:
+    briefing = (bundle or {}).get("briefing") or {}
+    metadata = page.get("transcript_metadata", {}) or {}
+    people = (bundle or {}).get("people", [])
+    locations = (bundle or {}).get("locations", [])
+    events = (bundle or {}).get("event_suggestions", [])
+
+    document_date = normalize_document_date(briefing.get("document_date"), metadata)
+    document_order = normalize_document_order(briefing.get("document_order"), metadata)
+    primary_people = normalize_entity_refs(
+        briefing.get("primary_people") or [],
+        people,
+        id_key="id",
+        label_keys=("display_name", "alternate_names"),
+    )
+    if not primary_people:
+        primary_people = [
+            {
+                "label": person.get("display_name") or person.get("id"),
+                "canonical_id": person.get("id"),
+                "role_or_relationship": ", ".join(person.get("roles", [])[:2]) or None,
+                "confidence": person.get("confidence"),
+            }
+            for person in people[:8]
+            if person.get("id") or person.get("display_name")
+        ]
+
+    primary_locations = normalize_entity_refs(
+        briefing.get("primary_locations") or [],
+        locations,
+        id_key="id",
+        label_keys=("name", "address_1886", "address_1887", "modern_address"),
+    )
+    if not primary_locations:
+        primary_locations = [
+            {
+                "label": location.get("name") or location.get("id"),
+                "canonical_id": location.get("id"),
+                "role_or_relationship": location.get("location_type"),
+                "confidence": location.get("confidence"),
+            }
+            for location in locations[:8]
+            if location.get("id") or location.get("name")
+        ]
+
+    referenced_events = normalize_event_refs(briefing.get("referenced_events") or [], events, people, locations)
+    if not referenced_events:
+        referenced_events = [event_to_navigation_ref(event, people, locations) for event in events[:8]]
+
+    return {
+        "brief_title": briefing.get("brief_title") or page.get("title"),
+        "navigation_summary": briefing.get("navigation_summary") or briefing.get("summary") or "",
+        "document_date": document_date,
+        "document_order": document_order,
+        "document_role": briefing.get("document_role") or infer_document_role(page),
+        "topics": sorted({str(topic).strip() for topic in briefing.get("topics", []) if str(topic).strip()}),
+        "primary_people": primary_people,
+        "primary_locations": primary_locations,
+        "referenced_events": referenced_events,
+        "claim_count": len((bundle or {}).get("claims", [])),
+        "event_reference_count": len(referenced_events),
+        "confidence": average_confidence([*primary_people, *primary_locations, *referenced_events]),
+    }
+
+
+def normalize_document_date(value: Any, metadata: dict[str, Any]) -> dict[str, Any]:
+    source = value if isinstance(value, dict) else {}
+    original_text = source.get("original_text") or metadata.get("date_text")
+    normalized = source.get("normalized_date") or parse_date_text(original_text)
+    return {
+        "original_text": original_text,
+        "normalized_date": normalized,
+        "precision": source.get("precision") or ("day" if normalized else "unknown"),
+    }
+
+
+def normalize_document_order(value: Any, metadata: dict[str, Any]) -> dict[str, Any]:
+    source = value if isinstance(value, dict) else {}
+    page_start, page_end = parse_page_range(metadata.get("pages"))
+    return {
+        "volume": source.get("volume") or metadata.get("volume"),
+        "page_start": source.get("page_start") if source.get("page_start") is not None else page_start,
+        "page_end": source.get("page_end") if source.get("page_end") is not None else page_end,
+        "sequence_label": source.get("sequence_label") or metadata.get("pages"),
+    }
+
+
+def normalize_entity_refs(
+    refs: list[Any],
+    entities: list[dict[str, Any]],
+    *,
+    id_key: str,
+    label_keys: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    normalized = []
+    for ref in refs:
+        if not isinstance(ref, dict):
+            continue
+        label = ref.get("label")
+        canonical_id = ref.get("canonical_id")
+        entity = find_entity(canonical_id, label, entities, id_key=id_key, label_keys=label_keys)
+        normalized.append(
+            {
+                "label": entity_label(entity, label_keys) if entity else label,
+                "canonical_id": entity.get(id_key) if entity else canonical_id,
+                "role_or_relationship": ref.get("role_or_relationship"),
+                "confidence": ref.get("confidence"),
+            }
+        )
+    return [item for item in normalized if item.get("label") or item.get("canonical_id")]
+
+
+def normalize_event_refs(
+    refs: list[Any],
+    events: list[dict[str, Any]],
+    people: list[dict[str, Any]],
+    locations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    normalized = []
+    for ref in refs:
+        if not isinstance(ref, dict):
+            continue
+        event = find_entity(ref.get("canonical_id"), ref.get("label"), events, id_key="id", label_keys=("title",))
+        if event:
+            item = event_to_navigation_ref(event, people, locations)
+            item["supporting_quote"] = ref.get("supporting_quote")
+            item["page_refs"] = ref.get("page_refs") or item["page_refs"]
+            normalized.append(item)
+            continue
+        normalized.append(
+            {
+                "label": ref.get("label"),
+                "canonical_id": ref.get("canonical_id"),
+                "event_time": ref.get("event_time") or empty_event_time(),
+                "location_label": ref.get("location_label"),
+                "location_id": ref.get("location_id"),
+                "participant_labels": ref.get("participant_labels") or [],
+                "participant_person_ids": ref.get("participant_person_ids") or [],
+                "summary": ref.get("summary") or "",
+                "supporting_quote": ref.get("supporting_quote"),
+                "page_refs": ref.get("page_refs") or [],
+                "confidence": ref.get("confidence"),
+            }
+        )
+    return [item for item in normalized if item.get("label")]
+
+
+def event_to_navigation_ref(
+    event: dict[str, Any],
+    people: list[dict[str, Any]],
+    locations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    people_by_id = {person.get("id"): person for person in people}
+    locations_by_id = {location.get("id"): location for location in locations}
+    location = locations_by_id.get(event.get("location_id"))
+    participant_ids = event.get("participant_person_ids", [])
+    return {
+        "label": event.get("title"),
+        "canonical_id": event.get("id"),
+        "event_time": event_time_to_ref(event.get("time") or {}),
+        "location_label": location.get("name") if location else None,
+        "location_id": event.get("location_id"),
+        "participant_labels": [
+            (people_by_id.get(person_id) or {}).get("display_name") or person_id
+            for person_id in participant_ids
+        ],
+        "participant_person_ids": participant_ids,
+        "summary": event.get("description") or "",
+        "supporting_quote": None,
+        "page_refs": [],
+        "confidence": event.get("confidence"),
+    }
+
+
+def event_time_to_ref(value: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "start": value.get("start"),
+        "end": value.get("end"),
+        "precision": value.get("precision") or "unknown",
+        "original_text": value.get("display") or value.get("original_text"),
+    }
+
+
+def empty_event_time() -> dict[str, Any]:
+    return {"start": None, "end": None, "precision": "unknown", "original_text": None}
+
+
+def find_entity(
+    canonical_id: Any,
+    label: Any,
+    entities: list[dict[str, Any]],
+    *,
+    id_key: str,
+    label_keys: tuple[str, ...],
+) -> dict[str, Any] | None:
+    if canonical_id:
+        match = next((entity for entity in entities if entity.get(id_key) == canonical_id), None)
+        if match:
+            return match
+    normalized_label = normalize_label(str(label or ""))
+    if not normalized_label:
+        return None
+    for entity in entities:
+        labels: list[Any] = []
+        for key in label_keys:
+            value = entity.get(key)
+            labels.extend(value if isinstance(value, list) else [value])
+        if any(normalize_label(str(candidate or "")) == normalized_label for candidate in labels):
+            return entity
+    return None
+
+
+def entity_label(entity: dict[str, Any], label_keys: tuple[str, ...]) -> str | None:
+    for key in label_keys:
+        value = entity.get(key)
+        if isinstance(value, list):
+            value = next((item for item in value if item), None)
+        if value:
+            return str(value)
+    return None
+
+
+def average_confidence(items: list[dict[str, Any]]) -> float | None:
+    values = [float(item["confidence"]) for item in items if isinstance(item.get("confidence"), (int, float))]
+    if not values:
+        return None
+    return round(sum(values) / len(values), 3)
+
+
+def infer_document_role(page: dict[str, Any]) -> str:
+    source_type = page.get("source_type")
+    if source_type in {"testimony", "exhibit", "toc"}:
+        return source_type
+    title = str(page.get("title") or "").lower()
+    if "cover page" in title:
+        return "cover"
+    if any(term in title for term in ("summons", "motion", "order", "indictment")):
+        return "legal_document"
+    return "other"
+
+
+def parse_page_range(value: Any) -> tuple[int | None, int | None]:
+    numbers = [int(match) for match in re.findall(r"\d+", str(value or ""))]
+    if not numbers:
+        return None, None
+    return numbers[0], numbers[-1]
+
+
+def normalize_label(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip().lower())
+
+
+def parse_date_text(value: Any) -> str | None:
+    text = str(value or "").strip().replace("Sept.", "Sep.").replace("August", "Aug.")
+    if not text:
+        return None
+    patterns = [
+        ("%Y %B %d", r"(\d{4})\s+([A-Za-z]+)\.?\s+(\d{1,2})"),
+        ("%Y %b %d", r"(\d{4})\s+([A-Za-z]+)\.?\s+(\d{1,2})"),
+        ("%B %d, %Y", r"([A-Za-z]+)\.?\s+(\d{1,2}),\s*(\d{4})"),
+        ("%b %d, %Y", r"([A-Za-z]+)\.?\s+(\d{1,2}),\s*(\d{4})"),
+    ]
+    for fmt, pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        candidate = " ".join(match.groups()) if fmt.startswith("%Y") else f"{match.group(1)} {match.group(2)}, {match.group(3)}"
+        try:
+            return datetime.strptime(candidate.replace(".", ""), fmt.replace(".", "")).date().isoformat()
+        except ValueError:
+            continue
+    return None
 
 
 def write_harmonized_transcripts(storage: JsonStorage, pages: list[dict[str, Any]], bundles: list[dict[str, Any]]) -> dict[str, int]:

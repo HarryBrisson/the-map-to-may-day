@@ -70,7 +70,7 @@ def test_transcript_api_reads_local_tei_and_json(tmp_path, monkeypatch) -> None:
                 "url": "https://example.test/source.htm",
                 "title": "Testimony of John Bonfield",
                 "source_type": "testimony",
-                "transcript_metadata": {"volume": "I"},
+                "transcript_metadata": {"volume": "I", "pages": "19-52", "date_text": "1886 July 16", "witness_name": "John Bonfield"},
                 "source_stats": {"lines": 1},
                 "raw_html_path": html_path,
                 "tei_path": tei_path,
@@ -104,6 +104,9 @@ def test_transcript_api_reads_local_tei_and_json(tmp_path, monkeypatch) -> None:
     assert page_response.status_code == 200
     assert catalog_response.status_code == 200
     assert catalog_response.get_json()[0]["id"] == source_id
+    assert catalog_response.get_json()[0]["navigation"]["document_date"]["normalized_date"] == "1886-07-16"
+    assert catalog_response.get_json()[0]["navigation"]["document_order"]["page_start"] == 19
+    assert catalog_response.get_json()[0]["navigation"]["primary_people"][0]["label"] == "John Bonfield"
     assert transcript_response.status_code == 200
     assert transcript_response.get_json()["source_id"] == source_id
     assert tei_response.status_code == 200

@@ -7,17 +7,51 @@
   "required": [
     "source_id",
     "summary",
+    "brief_title",
+    "navigation_summary",
+    "document_date",
+    "document_order",
+    "document_role",
     "witness",
     "examiners",
     "defendants_referenced",
     "key_locations",
     "key_dates",
     "topics",
+    "primary_people",
+    "primary_locations",
+    "referenced_events",
     "speaker_directory"
   ],
   "properties": {
     "source_id": { "type": "string" },
     "summary": { "type": "string" },
+    "brief_title": { "type": "string" },
+    "navigation_summary": { "type": "string" },
+    "document_date": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["original_text", "normalized_date", "precision"],
+      "properties": {
+        "original_text": { "type": ["string", "null"] },
+        "normalized_date": { "type": ["string", "null"] },
+        "precision": { "type": "string" }
+      }
+    },
+    "document_order": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["volume", "page_start", "page_end", "sequence_label"],
+      "properties": {
+        "volume": { "type": ["string", "null"] },
+        "page_start": { "type": ["integer", "null"] },
+        "page_end": { "type": ["integer", "null"] },
+        "sequence_label": { "type": ["string", "null"] }
+      }
+    },
+    "document_role": {
+      "enum": ["testimony", "exhibit", "procedural", "toc", "cover", "legal_document", "other"]
+    },
     "witness": {
       "type": ["object", "null"],
       "additionalProperties": false,
@@ -43,6 +77,77 @@
     "key_locations": { "type": "array", "items": { "type": "string" } },
     "key_dates": { "type": "array", "items": { "type": "string" } },
     "topics": { "type": "array", "items": { "type": "string" } },
+    "primary_people": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["label", "canonical_id", "role_or_relationship", "confidence"],
+        "properties": {
+          "label": { "type": "string" },
+          "canonical_id": { "type": ["string", "null"] },
+          "role_or_relationship": { "type": ["string", "null"] },
+          "confidence": { "type": "number" }
+        }
+      }
+    },
+    "primary_locations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["label", "canonical_id", "role_or_relationship", "confidence"],
+        "properties": {
+          "label": { "type": "string" },
+          "canonical_id": { "type": ["string", "null"] },
+          "role_or_relationship": { "type": ["string", "null"] },
+          "confidence": { "type": "number" }
+        }
+      }
+    },
+    "referenced_events": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "label",
+          "canonical_id",
+          "event_time",
+          "location_label",
+          "location_id",
+          "participant_labels",
+          "participant_person_ids",
+          "summary",
+          "supporting_quote",
+          "page_refs",
+          "confidence"
+        ],
+        "properties": {
+          "label": { "type": "string" },
+          "canonical_id": { "type": ["string", "null"] },
+          "event_time": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["start", "end", "precision", "original_text"],
+            "properties": {
+              "start": { "type": ["string", "null"] },
+              "end": { "type": ["string", "null"] },
+              "precision": { "type": "string" },
+              "original_text": { "type": ["string", "null"] }
+            }
+          },
+          "location_label": { "type": ["string", "null"] },
+          "location_id": { "type": ["string", "null"] },
+          "participant_labels": { "type": "array", "items": { "type": "string" } },
+          "participant_person_ids": { "type": "array", "items": { "type": "string" } },
+          "summary": { "type": "string" },
+          "supporting_quote": { "type": ["string", "null"] },
+          "page_refs": { "type": "array", "items": { "type": "string" } },
+          "confidence": { "type": "number" }
+        }
+      }
+    },
     "speaker_directory": {
       "type": "array",
       "items": {
