@@ -123,3 +123,65 @@ def write_cached_bundle(
 def clear_cache(storage: JsonStorage) -> int:
     """Wipe the entire haymarket cache. Returns file count cleared."""
     return storage.clear_prefix(CACHE_PREFIX)
+
+
+def cache_inventory(data_dir) -> dict[str, Any]:
+    """Walk the local cache directory and return per-config summaries.
+
+    Local-disk only for now (LocalJsonStorage). S3 support would need a
+    list_prefix abstraction on JsonStorage, but cache-status is a
+    debugging tool — we'll add S3 if/when someone needs it.
+    """
+    from pathlib import Path
+
+    base = Path(data_dir) / CACHE_PREFIX
+    if not base.exists():
+        return {"base_path": str(base), "configs": [], "total_pages": 0, "total_cost_usd": 0.0}
+
+    configs: list[dict[str, Any]] = []
+    total_cost = 0.0
+    total_pages = 0
+
+    for cfg_dir in sorted(p for p in base.iterdir() if p.is_dir()):
+        entries: list[dict[str, Any]] = []
+        cfg_cost = 0.0
+        cfg_config: dict[str, Any] | None = None
+        for page_dir in sorted(p for p in cfg_dir.iterdir() if p.is_dir()):
+            metadata_path = page_dir / "metadata.json"
+            bundle_path = page_dir / "bundle.json"
+            if not metadata_path.exists() or not bundle_path.exists():
+                continue
+            try:
+                metadata = json.loads(metadata_path.read_text())
+            except Exception:
+                continue
+            cost = float(metadata.get("cost_usd") or 0.0)
+            cfg_cost += cost
+            total_cost += cost
+            total_pages += 1
+            entries.append(
+                {
+                    "page_id": page_dir.name,
+                    "produced_at": metadata.get("produced_at"),
+                    "produced_by_run_id": metadata.get("produced_by_run_id"),
+                    "cost_usd": round(cost, 8),
+                }
+            )
+            if cfg_config is None:
+                cfg_config = metadata.get("config") or {}
+        configs.append(
+            {
+                "cache_key": cfg_dir.name,
+                "config": cfg_config or {},
+                "page_count": len(entries),
+                "cost_usd": round(cfg_cost, 8),
+                "pages": entries,
+            }
+        )
+
+    return {
+        "base_path": str(base),
+        "configs": configs,
+        "total_pages": total_pages,
+        "total_cost_usd": round(total_cost, 8),
+    }

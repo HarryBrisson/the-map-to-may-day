@@ -55,7 +55,11 @@ MODEL_SLATES: dict[str, list[str]] = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Haymarket trial corpus pipeline")
     parser.add_argument("--user", default="local@example.com", help="User email for future S3 path compatibility")
-    parser.add_argument("--action", choices=["pull", "enrich", "geocode", "all"], default="all")
+    parser.add_argument(
+        "--action",
+        choices=["pull", "enrich", "geocode", "all", "cache-status"],
+        default="all",
+    )
     parser.add_argument("--corpus", choices=["test", "full"], default="test")
     parser.add_argument("--test", action="store_true", help="Shortcut for --corpus test")
     parser.add_argument("--source", choices=["hadc"], default="hadc")
@@ -181,6 +185,39 @@ def make_run_id() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
+def print_cache_status(data_dir: str) -> None:
+    from utils.page_cache import cache_inventory
+
+    inventory = cache_inventory(data_dir)
+    base = inventory["base_path"]
+    if inventory["total_pages"] == 0:
+        print(f"Cache empty ({base})")
+        return
+
+    print(f"Cache: {base}")
+    print(f"  {len(inventory['configs'])} config(s), {inventory['total_pages']} cached page(s), "
+          f"${inventory['total_cost_usd']:.4f} of producer cost")
+    for cfg in inventory["configs"]:
+        config = cfg["config"] or {}
+        config_summary = (
+            f"briefing={config.get('briefing_model', '?')}  "
+            f"transcription={config.get('transcription_model', '?')}/{config.get('transcription_format', '?')}  "
+            f"tagging={config.get('tagging_model', '?')}"
+        )
+        print(
+            f"\n  config {cfg['cache_key']}  "
+            f"({cfg['page_count']} page(s), ${cfg['cost_usd']:.4f})"
+        )
+        print(f"    {config_summary}")
+        for entry in cfg["pages"]:
+            produced = (entry.get("produced_at") or "")[:19].replace("T", " ")
+            run_label = entry.get("produced_by_run_id") or "?"
+            print(
+                f"    - {entry['page_id']:35s}  ${entry['cost_usd']:>7.4f}  "
+                f"{produced}  by {run_label}"
+            )
+
+
 def clear_generated_data(storage) -> dict[str, int]:
     prefixes = ["raw/haymarket", "enriched/haymarket"]
     return {prefix: storage.clear_prefix(prefix) for prefix in prefixes}
@@ -235,6 +272,10 @@ def main() -> None:
             for prefix, count in cleared.items():
                 print(f"- {prefix}: {count} file(s)")
             print(f"Total cleared: {total} file(s)")
+
+        if args.action == "cache-status":
+            print_cache_status(args.data_dir)
+            return
 
         if args.action in {"pull", "all"}:
             pages = pull_corpus(args.corpus, storage, run_id)
