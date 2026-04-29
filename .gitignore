@@ -8,3 +8,4 @@ pipeline/creds.json
 data/
 .venv/
 venv/
+data.bak/
