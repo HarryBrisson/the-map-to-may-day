@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any
 
 from enrichment.harmonization import harmonize_bundles
 from enrichment.llm_extraction import extract_pages_with_audit
 from enrichment.schema_validation import validate_items
+from enrichment.stage_briefing import run_briefing
+from enrichment.progress import StageProgress
 from sources.hadc_source import add_standoff_annotations_to_tei, tei_to_transcript_json
+from utils.ids import slugify
 from utils.s3_storage import JsonStorage
 
 
@@ -135,6 +139,192 @@ def run_enrichment(
         "model_eval": extraction["model_eval"],
         "cost_summary": extraction["cost_summary"],
     }
+
+
+def run_brief_update(
+    storage: JsonStorage,
+    run_id: str,
+    corpus: str,
+    briefing_model: str = "gpt-5-mini",
+    streaming: bool = True,
+    page_filter: list[str] | None = None,
+    resume: bool = True,
+    max_brief_workers: int = 1,
+) -> dict[str, Any]:
+    pages = load_pages(storage, run_id)
+    if page_filter:
+        before = len(pages)
+        pages = [page for page in pages if any(token in page["id"] for token in page_filter)]
+        print(f"Filtered pages by {page_filter}: {before} -> {len(pages)} page(s)")
+        if not pages:
+            raise RuntimeError(f"--pages filter {page_filter} matched 0 pages")
+
+    existing_people = read_dataset_if_available(storage, "enriched/haymarket/people/latest.json")
+    existing_locations = read_dataset_if_available(storage, "enriched/haymarket/locations/latest.json")
+    existing_claims = read_dataset_if_available(storage, "enriched/haymarket/claims/latest.json")
+    existing_events = read_dataset_if_available(storage, "enriched/haymarket/events/latest.json")
+
+    briefings_by_source: dict[str, dict[str, Any]] = {}
+    audit_records: list[dict[str, Any]] = []
+    total_cost = 0.0
+    total_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "reasoning_tokens": 0, "cached_input_tokens": 0}
+    reused = 0
+    pages_to_brief = [page for page in pages if page.get("source_type") != "toc"]
+    for page in pages:
+        if page.get("source_type") == "toc":
+            print(f"Skipping brief update for {page['id']} (source_type=toc)")
+
+    def brief_page(page: dict[str, Any]) -> dict[str, Any]:
+        cached_audit = read_successful_brief_audit(storage, run_id, briefing_model, page["id"]) if resume else None
+        if cached_audit:
+            result = briefing_result_from_audit(cached_audit, run_id, briefing_model, page["id"])
+            StageProgress(page["id"], "briefing", enabled=streaming).info("reused existing successful brief")
+            result["reused"] = True
+            return result
+        result = run_briefing(
+            page=page,
+            storage=storage,
+            run_id=run_id,
+            model=briefing_model,
+            progress=StageProgress(page["id"], "briefing", enabled=streaming),
+        )
+        result["reused"] = False
+        return result
+
+    max_workers = max(1, int(max_brief_workers or 1))
+    if max_workers > 1:
+        print(f"Brief update workers: {max_workers}")
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(brief_page, page): page for page in pages_to_brief}
+        for future in as_completed(futures):
+            page = futures[future]
+            result = future.result()
+            if result.get("reused"):
+                reused += 1
+            if result.get("audit") is None:
+                raise RuntimeError(f"Briefing produced no audit record for {page['id']}")
+            audit_records.append(result["audit"])
+            total_cost += float(result.get("cost_usd") or 0.0)
+            for key in total_usage:
+                total_usage[key] += (result.get("usage") or {}).get(key, 0)
+            if result["status"] in {"success", "cached"}:
+                briefings_by_source[page["id"]] = result["briefing"] or {}
+
+    bundles = [
+        brief_navigation_bundle(
+            page=page,
+            briefing=briefings_by_source.get(page["id"]),
+            people=existing_people,
+            locations=existing_locations,
+            claims=existing_claims,
+            events=existing_events,
+        )
+        for page in pages
+    ]
+    sources = source_summaries(pages, bundles)
+    storage.write_json("enriched/haymarket/sources/latest.json", sources)
+
+    manifest = read_json_if_available(storage, "enriched/haymarket/manifest/latest.json") or {}
+    manifest.update(
+        {
+            "run_id": manifest.get("run_id") or run_id,
+            "corpus": manifest.get("corpus") or corpus,
+            "sources_briefed_at": datetime.now(timezone.utc).isoformat(),
+            "sources_brief_run_id": run_id,
+            "sources_brief_model": briefing_model,
+        }
+    )
+    counts = dict(manifest.get("counts") or {})
+    counts["sources"] = len(sources)
+    manifest["counts"] = counts
+    storage.write_json("enriched/haymarket/manifest/latest.json", manifest)
+
+    return {
+        "sources": sources,
+        "briefings": len(briefings_by_source),
+        "pages": len(pages_to_brief),
+        "skipped": len(pages) - len(pages_to_brief),
+        "reused": reused,
+        "audit_records": audit_records,
+        "cost_usd": round(total_cost, 8),
+        "usage": total_usage,
+    }
+
+
+def read_successful_brief_audit(
+    storage: JsonStorage,
+    run_id: str,
+    model: str,
+    page_id: str,
+) -> dict[str, Any] | None:
+    audit_path = brief_audit_path(run_id, model, page_id)
+    if not storage.exists(audit_path):
+        return None
+    audit = storage.read_json(audit_path)
+    if audit.get("status") != "success" or not audit.get("parsed_output"):
+        return None
+    return audit
+
+
+def briefing_result_from_audit(audit: dict[str, Any], run_id: str, model: str, page_id: str) -> dict[str, Any]:
+    return {
+        "briefing": audit.get("parsed_output") or {},
+        "audit": audit,
+        "usage": zero_usage(),
+        "cost_usd": 0.0,
+        "status": "cached",
+        "error": None,
+        "audit_path": brief_audit_path(run_id, model, page_id),
+    }
+
+
+def brief_audit_path(run_id: str, model: str, page_id: str) -> str:
+    return f"raw/haymarket/llm/{run_id}/{slugify(model)}/{page_id}/briefing.json"
+
+
+def zero_usage() -> dict[str, int]:
+    return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "reasoning_tokens": 0, "cached_input_tokens": 0}
+
+
+def brief_navigation_bundle(
+    page: dict[str, Any],
+    briefing: dict[str, Any] | None,
+    people: list[dict[str, Any]],
+    locations: list[dict[str, Any]],
+    claims: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    source_id = page["id"]
+    source_claims = [claim for claim in claims if claim.get("source_id") == source_id]
+    source_claim_ids = {claim.get("id") for claim in source_claims}
+    return {
+        "source_id": source_id,
+        "briefing": briefing,
+        "people": [person for person in people if source_id in person.get("source_ids", [])],
+        "locations": [location for location in locations if source_id in location.get("source_ids", [])],
+        "claims": source_claims,
+        "event_suggestions": [
+            event
+            for event in events
+            if source_claim_ids.intersection(event.get("claim_ids", []))
+        ],
+        "quotes": [],
+    }
+
+
+def read_dataset_if_available(storage: JsonStorage, relative_path: str) -> list[dict[str, Any]]:
+    data = read_json_if_available(storage, relative_path)
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict) and isinstance(data.get("items"), list):
+        return data["items"]
+    return []
+
+
+def read_json_if_available(storage: JsonStorage, relative_path: str) -> Any:
+    if not storage.exists(relative_path):
+        return None
+    return storage.read_json(relative_path)
 
 
 def print_cost_summary(cost_summary: dict[str, Any]) -> None:

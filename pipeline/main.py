@@ -16,7 +16,7 @@ REPO_ROOT = PIPELINE_ROOT.parent
 sys.path.insert(0, str(PIPELINE_ROOT))
 
 from enrichment.geolocate_locations import run_geolocation  # noqa: E402
-from enrichment.pipeline import run_enrichment  # noqa: E402
+from enrichment.pipeline import run_brief_update, run_enrichment  # noqa: E402
 from sources.hadc_source import pull_corpus  # noqa: E402
 from utils.s3_storage import make_storage  # noqa: E402
 
@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--user", default="local@example.com", help="User email for future S3 path compatibility")
     parser.add_argument(
         "--action",
-        choices=["pull", "enrich", "geocode", "all", "cache-status"],
+        choices=["pull", "briefs", "enrich", "geocode", "all", "cache-status"],
         default="all",
     )
     parser.add_argument("--corpus", choices=["test", "full"], default="test")
@@ -116,6 +116,15 @@ def parse_args() -> argparse.Namespace:
         help="Concurrent OpenAI calls during Stage C per-unit tagging.",
     )
     parser.add_argument(
+        "--max-brief-workers",
+        type=int,
+        default=1,
+        help=(
+            "Concurrent OpenAI calls for --action briefs. Default 1 preserves sequential output; "
+            "Tier 5 users can usually try 32 or 64 with resume enabled."
+        ),
+    )
+    parser.add_argument(
         "--tagging-attempts",
         type=int,
         default=3,
@@ -166,6 +175,15 @@ def parse_args() -> argparse.Namespace:
             "config (models, prompts, source-text hash) are reused, and successful new bundles "
             "are written to data/cache/haymarket/. Pass --no-cache to force every page to re-run "
             "all three stages and not write back to the cache."
+        ),
+    )
+    parser.add_argument(
+        "--no-resume-briefs",
+        action="store_true",
+        help=(
+            "For --action briefs, ignore successful briefing audit files already written under "
+            "the same --run-id and call the model again. By default, brief updates resume and "
+            "reuse successful per-page briefs."
         ),
     )
     parser.add_argument(
@@ -280,6 +298,26 @@ def main() -> None:
         if args.action in {"pull", "all"}:
             pages = pull_corpus(args.corpus, storage, run_id)
             print(f"Pulled {len(pages)} HADC pages")
+
+        if args.action == "briefs":
+            result = run_brief_update(
+                storage=storage,
+                run_id=run_id,
+                corpus=args.corpus,
+                briefing_model=args.briefing_model,
+                streaming=not args.no_streaming,
+                page_filter=args.pages,
+                resume=not args.no_resume_briefs,
+                max_brief_workers=args.max_brief_workers,
+            )
+            print(
+                "Updated source briefs: "
+                f"{result['briefings']} of {result['pages']} page(s) briefed, "
+                f"{result['reused']} reused, "
+                f"{result['skipped']} skipped, "
+                f"{len(result['sources'])} source navigation records written"
+            )
+            print(f"LLM cost for brief update: ${result['cost_usd']:.6f}")
 
         if args.action in {"enrich", "all"}:
             result = run_enrichment(

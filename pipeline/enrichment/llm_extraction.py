@@ -12,6 +12,7 @@ from enrichment.stage_transcription import (
     run_transcription,
 )
 from utils.openai_schema import LLMCallError, MODEL_PRICING_PER_1M, estimate_cost_usd
+from utils.ids import slugify
 from utils.page_cache import (
     compute_cache_key,
     read_cached_bundle,
@@ -340,8 +341,6 @@ def _zero_usage() -> dict[str, int]:
 
 
 def _slug(value: str) -> str:
-    from utils.ids import slugify
-
     return slugify(value)
 
 
