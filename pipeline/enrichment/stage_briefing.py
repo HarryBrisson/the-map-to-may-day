@@ -16,7 +16,7 @@ from utils.openai_schema import (
 from utils.s3_storage import JsonStorage
 
 
-BRIEFING_PROMPT_TEMPLATE = "haymarket_page_briefing_v4"
+BRIEFING_PROMPT_TEMPLATE = "haymarket_page_briefing_v5"
 # Bumped from 2k to 8k so reasoning models (gpt-5 family) have room for both
 # reasoning tokens and the structured answer. Briefing identifying every
 # speaker on a long page benefits from reasoning, but the budget needs
@@ -146,8 +146,12 @@ def build_briefing_messages(page: dict[str, Any]) -> list[dict[str, str]]:
                 "evidence introduction, document creation, or source description. Put filing, "
                 "publication, cataloging, page copying, and introduction-into-evidence events in "
                 "document_events, not referenced_events, unless the act is also a substantive "
-                "historical event discussed by the page. Include event_time, place, participants, "
-                "a short summary, page_refs, and a short source-grounded supporting_quote when "
+                "historical event discussed by the page. Do not add routine adjournments, recesses, or generic 'testimony given' "
+                "events when they merely duplicate document_date; the source date already supports "
+                "source chronology. Keep document_events empty if the page has no meaningful "
+                "publication, filing, evidence-introduction, document-creation, or substantive "
+                "court-order lifecycle event beyond its document_date. Include event_time, place, "
+                "participants, a short summary, page_refs, and a short source-grounded supporting_quote when "
                 "available. page_refs should be the nearest page marker labels only (for example "
                 "\"24\" or \"3 1/2\"), not ranges like \"pp. 24-27\". Set referenced_events "
                 "canonical_id only when the page clearly reuses an existing event_ id, otherwise null. "

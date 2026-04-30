@@ -683,8 +683,10 @@ def build_source_navigation(page: dict[str, Any], bundle: dict[str, Any] | None 
 
     raw_referenced_events = briefing.get("referenced_events") or []
     raw_document_events = briefing.get("document_events") or []
-    if not raw_document_events:
-        raw_referenced_events, raw_document_events = split_document_event_refs(raw_referenced_events)
+    raw_referenced_events, split_document_events = split_document_event_refs(raw_referenced_events)
+    split_historical_events, raw_document_events = split_historical_refs_from_document_events(raw_document_events)
+    raw_referenced_events = [*raw_referenced_events, *split_historical_events]
+    raw_document_events = [*raw_document_events, *split_document_events]
 
     referenced_events = normalize_event_refs(
         raw_referenced_events,
@@ -699,6 +701,7 @@ def build_source_navigation(page: dict[str, Any], bundle: dict[str, Any] | None 
         all_people,
         all_locations,
     )
+    document_events = filter_document_events(document_events, document_date)
 
     return {
         "brief_title": briefing.get("brief_title") or page.get("title"),
@@ -815,6 +818,47 @@ def normalize_event_refs(
     return [item for item in normalized if item.get("label")]
 
 
+def filter_document_events(events: list[dict[str, Any]], document_date: dict[str, Any]) -> list[dict[str, Any]]:
+    filtered: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for event in events:
+        if is_low_value_document_event(event, document_date):
+            continue
+        key = "|".join(
+            [
+                str((event.get("event_time") or {}).get("normalized_date") or (event.get("event_time") or {}).get("start") or ""),
+                normalize_label(str(event.get("event_kind") or "")),
+                normalize_label(str(event.get("label") or "")),
+                normalize_label(str(event.get("location_label") or "")),
+            ]
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        filtered.append(event)
+    return filtered
+
+
+def is_low_value_document_event(event: dict[str, Any], document_date: dict[str, Any]) -> bool:
+    text = normalize_label(" ".join(str(event.get(key) or "") for key in ("label", "summary")))
+    if any(term in text for term in ("adjournment", "adjourned", "recess")):
+        return True
+    generic_testimony_terms = (
+        "testimony given",
+        "court testimony given",
+        "court testimony recorded",
+        "witness testimony given",
+        "witness testimony recorded",
+        "testimony recorded",
+    )
+    if any(term in text for term in generic_testimony_terms):
+        event_date = ((event.get("event_time") or {}).get("normalized_date") or (event.get("event_time") or {}).get("start") or "")[:10]
+        source_date = str((document_date or {}).get("normalized_date") or "")[:10]
+        if not event_date or event_date == source_date:
+            return True
+    return False
+
+
 def normalize_document_event_refs(
     refs: list[Any],
     people: list[dict[str, Any]],
@@ -854,6 +898,29 @@ def split_document_event_refs(refs: list[Any]) -> tuple[list[Any], list[Any]]:
     return historical_refs, document_refs
 
 
+def split_historical_refs_from_document_events(refs: list[Any]) -> tuple[list[Any], list[Any]]:
+    historical_refs: list[Any] = []
+    document_refs: list[Any] = []
+    for ref in refs:
+        if isinstance(ref, dict) and is_historical_like_document_event(ref):
+            historical_ref = dict(ref)
+            historical_ref.pop("event_kind", None)
+            historical_ref.setdefault("canonical_id", None)
+            historical_refs.append(historical_ref)
+        else:
+            document_refs.append(ref)
+    return historical_refs, document_refs
+
+
+def is_historical_like_document_event(ref: dict[str, Any]) -> bool:
+    if ref.get("event_kind") != "court_procedure":
+        return False
+    label = normalize_label(str(ref.get("label") or ""))
+    historical_terms = ("haymarket", "mccormick", "bomb", "bombing", "meeting", "search", "arrest", "speech", "procession")
+    procedural_terms = ("petition", "venue", "remand", "arraignment", "sentencing", "judgment", "filing", "publication", "introduced")
+    return any(term in label for term in historical_terms) and not any(term in label for term in procedural_terms)
+
+
 def is_document_event_ref(ref: dict[str, Any]) -> bool:
     text = normalize_label(" ".join(str(ref.get(key) or "") for key in ("label", "summary")))
     document_terms = (
@@ -869,7 +936,6 @@ def is_document_event_ref(ref: dict[str, Any]) -> bool:
         "change of venue",
         "petition",
         "motion",
-        "order",
         "arraignment",
         "remand",
         "grand jury presentment",
