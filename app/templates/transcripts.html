@@ -6,9 +6,46 @@
 <section class="transcript-shell">
   <aside class="control-panel">
     <section class="panel-section">
-      <h2>Transcripts</h2>
+      <h2>Documents</h2>
+      <div class="view-tabs" role="tablist" aria-label="Document views">
+        <button type="button" class="is-active" data-view-tab="sources">Sources</button>
+        <button type="button" data-view-tab="events">Events</button>
+        <button type="button" data-view-tab="document-events">Document Events</button>
+      </div>
       <label for="transcript-search">Search sources</label>
       <input id="transcript-search" type="search" placeholder="Bonfield, exhibit, page...">
+      <label for="source-type-filter">Source type</label>
+      <select id="source-type-filter">
+        <option value="">All types</option>
+      </select>
+      <label for="person-nav-filter">Person</label>
+      <select id="person-nav-filter">
+        <option value="">All people</option>
+      </select>
+      <label for="location-nav-filter">Place</label>
+      <select id="location-nav-filter">
+        <option value="">All places</option>
+      </select>
+      <div id="event-filter-wrap">
+        <label for="event-nav-filter">Referenced event</label>
+        <select id="event-nav-filter">
+          <option value="">All events</option>
+        </select>
+      </div>
+      <label for="topic-filter">Topic</label>
+      <select id="topic-filter">
+        <option value="">All topics</option>
+      </select>
+      <div class="date-grid">
+        <div>
+          <label for="nav-start-date">Start date</label>
+          <input id="nav-start-date" type="date">
+        </div>
+        <div>
+          <label for="nav-end-date">End date</label>
+          <input id="nav-end-date" type="date">
+        </div>
+      </div>
       <div id="transcript-count" class="muted">Loading transcripts...</div>
       <div id="transcript-list" class="transcript-list"></div>
     </section>

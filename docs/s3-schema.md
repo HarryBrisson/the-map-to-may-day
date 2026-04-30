@@ -99,6 +99,29 @@ The app-ready claim records also include a `source` object added during enrichme
 
 Events are normalized historical happenings assembled from one or more claims. They retain `claim_ids` so disputed testimony can be inspected. See `pipeline/schemas/event.schema.json`.
 
+### Source
+
+Sources preserve the HADC page metadata used by the transcript navigator. Each source summary includes the old path fields plus a `navigation` object derived from the Stage A brief when available, with metadata fallbacks when it is not:
+
+- `navigation.document_date`
+- `navigation.document_order`
+- `navigation.document_role`
+- `navigation.brief_title`
+- `navigation.navigation_summary`
+- `navigation.topics`
+- `navigation.primary_people`
+- `navigation.primary_locations`
+- `navigation.referenced_events`
+- `navigation.document_events`
+- `navigation.claim_count`
+- `navigation.event_reference_count`
+- `navigation.document_event_count`
+- `navigation.confidence`
+
+`navigation.referenced_events` are document-level references for browsing and evidence support. They do not replace `enriched/haymarket/events/latest.json`, which remains the canonical normalized event dataset.
+
+`navigation.document_events` are source/procedural lifecycle events such as publication, filing, court procedure, evidence introduction, document creation, or source description. These support a separate document-event timeline without mixing procedural dates into the historical event timeline.
+
 ## LLM Cost And Model Evaluation
 
 Cost summary path: `enriched/haymarket/llm_costs/<run_id>.json`

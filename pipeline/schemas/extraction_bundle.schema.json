@@ -8,6 +8,7 @@
   "properties": {
     "source_id": { "type": "string" },
     "tei_xml": { "type": "string" },
+    "briefing": { "type": ["object", "null"], "additionalProperties": true },
     "people": {
       "type": "array",
       "items": { "$ref": "person.schema.json" }

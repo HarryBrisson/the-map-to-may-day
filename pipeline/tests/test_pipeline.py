@@ -15,7 +15,7 @@ from enrichment import stage_tagging  # noqa: E402
 from enrichment import stage_transcription  # noqa: E402
 from enrichment.geolocate_locations import geolocate_locations as geolocate_location_records  # noqa: E402
 from enrichment.harmonization import harmonize_bundles  # noqa: E402
-from enrichment.pipeline import merge_events, run_enrichment  # noqa: E402
+from enrichment.pipeline import merge_events, run_brief_update, run_enrichment  # noqa: E402
 from enrichment.stage_tagging import split_tei_into_units  # noqa: E402
 from enrichment.tei_validation import validate_generated_tei  # noqa: E402
 from main import clear_generated_data  # noqa: E402
@@ -437,12 +437,43 @@ def test_run_enrichment_writes_app_ready_outputs(tmp_path, monkeypatch) -> None:
     briefing = {
         "source_id": source_id,
         "summary": "Bonfield testifies about Desplaines Street Station.",
+        "brief_title": "Bonfield testimony",
+        "navigation_summary": "Bonfield describes police movement through Desplaines Street Station.",
+        "document_date": {"original_text": "1886 July 16", "normalized_date": "1886-07-16", "precision": "day"},
+        "document_order": {"volume": "I", "page_start": 19, "page_end": 52, "sequence_label": "19-52"},
+        "document_role": "testimony",
         "witness": {"name": "John Bonfield", "role": "police"},
         "examiners": [],
         "defendants_referenced": [],
         "key_locations": ["Desplaines Street Station"],
         "key_dates": [],
         "topics": ["police movement"],
+        "primary_people": [
+            {"label": "John Bonfield", "canonical_id": None, "role_or_relationship": "witness", "confidence": 0.95},
+        ],
+        "primary_locations": [
+            {"label": "Desplaines Street Station", "canonical_id": None, "role_or_relationship": "police rendezvous", "confidence": 0.9},
+        ],
+        "referenced_events": [
+            {
+                "label": "Police rendezvous at Desplaines Street Station",
+                "canonical_id": None,
+                "event_time": {
+                    "start": "1886-05-04T18:00:00",
+                    "end": None,
+                    "precision": "approximate",
+                    "original_text": "in the vicinity of six o'clock",
+                },
+                "location_label": "Desplaines Street Station",
+                "location_id": None,
+                "participant_labels": ["John Bonfield"],
+                "participant_person_ids": [],
+                "summary": "Bonfield says police gathered at the station before moving toward Haymarket.",
+                "supporting_quote": "in the vicinity of six o'clock",
+                "page_refs": ["19"],
+                "confidence": 0.88,
+            }
+        ],
         "speaker_directory": [
             {"speaker_id": "#bonfield", "display_name": "John Bonfield", "role": "witness"},
         ],
@@ -573,6 +604,196 @@ def test_run_enrichment_writes_app_ready_outputs(tmp_path, monkeypatch) -> None:
     assert any(mention["entity_id"] == "person_john_bonfield" for mention in transcript["mentions"])
     assert any(mention["entity_id"] == "location_desplaines_street_station" for mention in transcript["mentions"])
     assert result["quotes"][0]["speaker_person_id"] == "person_john_bonfield"
+    source = storage.read_json("enriched/haymarket/sources/latest.json")[0]
+    assert source["navigation"]["document_date"]["normalized_date"] == "1886-07-16"
+    assert source["navigation"]["primary_people"][0]["canonical_id"] == "person_john_bonfield"
+    assert source["navigation"]["referenced_events"][0]["canonical_id"] == "event_police_rendezvous_at_desplaines_street_station_1886_05_04t18_00_00_location_desplaines_station"
+
+
+def test_run_brief_update_writes_source_navigation_without_transcription(tmp_path, monkeypatch) -> None:
+    storage = LocalJsonStorage(tmp_path)
+    run_id = "brief_run"
+    source_id = "source_hadc_i019_052"
+    storage.write_json(
+        f"raw/haymarket/hadc/{run_id}/pages.json",
+        [
+            {
+                "id": source_id,
+                "url": "https://example.test/I019-052.htm",
+                "title": "Testimony of John Bonfield",
+                "source_type": "testimony",
+                "fetched_at": "2026-04-27T00:00:00+00:00",
+                "raw_html_sha256": "abc123",
+                "candidate_text_sha256": "candidate123",
+                "raw_html_path": "raw.html",
+                "candidate_text_path": "text.txt",
+                "tei_path": "tei.xml",
+                "transcript_json_path": "transcript.json",
+                "text": "John Bonfield testified on July 16, 1886.",
+                "links": [],
+                "page_images": [],
+                "page_cues": [],
+                "transcript_metadata": {
+                    "volume": "I",
+                    "pages": "19-52",
+                    "date_text": "1886 July 16",
+                    "witness_name": "John Bonfield",
+                },
+                "source_stats": {"characters": 42, "lines": 1},
+            }
+        ],
+    )
+    storage.write_json(
+        "enriched/haymarket/people/latest.json",
+        [
+            {
+                "id": "person_john_bonfield",
+                "display_name": "John Bonfield",
+                "alternate_names": [],
+                "roles": ["witness"],
+                "bio": {"birth_year": None, "death_year": None, "occupation": None, "summary": None},
+                "source_ids": [source_id],
+                "confidence": 0.9,
+            }
+        ],
+    )
+    for dataset in ["locations", "claims", "events"]:
+        storage.write_json(f"enriched/haymarket/{dataset}/latest.json", [])
+
+    briefing = {
+        "source_id": source_id,
+        "summary": "Bonfield testimony.",
+        "brief_title": "Bonfield testimony",
+        "navigation_summary": "Bonfield gives testimony for the prosecution.",
+        "document_date": {"original_text": "1886 July 16", "normalized_date": "1886-07-16", "precision": "day"},
+        "document_order": {"volume": "I", "page_start": 19, "page_end": 52, "sequence_label": "19-52"},
+        "document_role": "testimony",
+        "witness": {"name": "John Bonfield", "role": "police"},
+        "examiners": [],
+        "defendants_referenced": [],
+        "key_locations": [],
+        "key_dates": [],
+        "topics": ["police testimony"],
+        "primary_people": [
+            {"label": "John Bonfield", "canonical_id": None, "role_or_relationship": "witness", "confidence": 0.95},
+        ],
+        "primary_locations": [],
+        "referenced_events": [],
+        "speaker_directory": [
+            {"speaker_id": "#bonfield", "display_name": "John Bonfield", "role": "witness"},
+        ],
+    }
+    usage = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+
+    def structured_response(model, input_messages, schema, schema_name, max_output_tokens=None, reasoning_effort=None):
+        del model, input_messages, schema, max_output_tokens, reasoning_effort
+        assert schema_name == "haymarket_page_briefing"
+        return briefing, {"output": "structured"}, usage
+
+    monkeypatch.setattr(stage_briefing, "call_openai_structured", structured_response)
+
+    result = run_brief_update(
+        storage=storage,
+        run_id=run_id,
+        corpus="test",
+        briefing_model="gpt-5-mini",
+        streaming=False,
+    )
+
+    assert result["briefings"] == 1
+    assert result["pages"] == 1
+    assert not storage.exists("raw.html")
+    source = storage.read_json("enriched/haymarket/sources/latest.json")[0]
+    assert source["navigation"]["brief_title"] == "Bonfield testimony"
+    assert source["navigation"]["document_date"]["normalized_date"] == "1886-07-16"
+    assert source["navigation"]["primary_people"][0]["canonical_id"] == "person_john_bonfield"
+
+
+def test_run_brief_update_reuses_successful_briefs_on_resume(tmp_path, monkeypatch) -> None:
+    storage = LocalJsonStorage(tmp_path)
+    run_id = "brief_resume"
+    source_id = "source_hadc_i019_052"
+    storage.write_json(
+        f"raw/haymarket/hadc/{run_id}/pages.json",
+        [
+            {
+                "id": source_id,
+                "url": "https://example.test/I019-052.htm",
+                "title": "Testimony of John Bonfield",
+                "source_type": "testimony",
+                "fetched_at": "2026-04-27T00:00:00+00:00",
+                "raw_html_sha256": "abc123",
+                "candidate_text_sha256": "candidate123",
+                "raw_html_path": "raw.html",
+                "candidate_text_path": "text.txt",
+                "tei_path": "tei.xml",
+                "transcript_json_path": "transcript.json",
+                "text": "John Bonfield testified on July 16, 1886.",
+                "links": [],
+                "page_images": [],
+                "page_cues": [],
+                "transcript_metadata": {"volume": "I", "pages": "19-52", "date_text": "1886 July 16"},
+                "source_stats": {"characters": 42, "lines": 1},
+            }
+        ],
+    )
+    for dataset in ["people", "locations", "claims", "events"]:
+        storage.write_json(f"enriched/haymarket/{dataset}/latest.json", [])
+
+    cached_briefing = {
+        "source_id": source_id,
+        "summary": "Cached Bonfield testimony.",
+        "brief_title": "Cached Bonfield testimony",
+        "navigation_summary": "Cached navigation summary.",
+        "document_date": {"original_text": "1886 July 16", "normalized_date": "1886-07-16", "precision": "day"},
+        "document_order": {"volume": "I", "page_start": 19, "page_end": 52, "sequence_label": "19-52"},
+        "document_role": "testimony",
+        "witness": {"name": "John Bonfield", "role": "police"},
+        "examiners": [],
+        "defendants_referenced": [],
+        "key_locations": [],
+        "key_dates": [],
+        "topics": [],
+        "primary_people": [],
+        "primary_locations": [],
+        "referenced_events": [],
+        "speaker_directory": [
+            {"speaker_id": "person_john_bonfield", "display_name": "John Bonfield", "role": "witness"},
+        ],
+    }
+    storage.write_json(
+        f"raw/haymarket/llm/{run_id}/gpt_5_mini/{source_id}/briefing.json",
+        {
+            "run_id": run_id,
+            "page_id": source_id,
+            "stage": "briefing",
+            "model": "gpt-5-mini",
+            "parsed_output": cached_briefing,
+            "usage": {"input_tokens": 99, "output_tokens": 88, "total_tokens": 187},
+            "cost_usd": 1.23,
+            "status": "success",
+            "error": None,
+        },
+    )
+
+    def fail_if_called(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("brief update should reuse cached successful briefing")
+
+    monkeypatch.setattr(stage_briefing, "call_openai_structured", fail_if_called)
+
+    result = run_brief_update(
+        storage=storage,
+        run_id=run_id,
+        corpus="test",
+        briefing_model="gpt-5-mini",
+        streaming=False,
+    )
+
+    assert result["reused"] == 1
+    assert result["cost_usd"] == 0
+    source = storage.read_json("enriched/haymarket/sources/latest.json")[0]
+    assert source["navigation"]["brief_title"] == "Cached Bonfield testimony"
 
 
 def test_claims_are_not_promoted_to_events_without_event_suggestions() -> None:
