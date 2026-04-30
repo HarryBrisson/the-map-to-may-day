@@ -112,11 +112,15 @@ Sources preserve the HADC page metadata used by the transcript navigator. Each s
 - `navigation.primary_people`
 - `navigation.primary_locations`
 - `navigation.referenced_events`
+- `navigation.document_events`
 - `navigation.claim_count`
 - `navigation.event_reference_count`
+- `navigation.document_event_count`
 - `navigation.confidence`
 
 `navigation.referenced_events` are document-level references for browsing and evidence support. They do not replace `enriched/haymarket/events/latest.json`, which remains the canonical normalized event dataset.
+
+`navigation.document_events` are source/procedural lifecycle events such as publication, filing, court procedure, evidence introduction, document creation, or source description. These support a separate document-event timeline without mixing procedural dates into the historical event timeline.
 
 ## LLM Cost And Model Evaluation
 

@@ -301,13 +301,16 @@ def brief_navigation_bundle(
         "source_id": source_id,
         "briefing": briefing,
         "people": [person for person in people if source_id in person.get("source_ids", [])],
+        "all_people": people,
         "locations": [location for location in locations if source_id in location.get("source_ids", [])],
+        "all_locations": locations,
         "claims": source_claims,
         "event_suggestions": [
             event
             for event in events
             if source_claim_ids.intersection(event.get("claim_ids", []))
         ],
+        "all_events": events,
         "quotes": [],
     }
 
@@ -533,12 +536,15 @@ def build_source_navigation(page: dict[str, Any], bundle: dict[str, Any] | None 
     people = (bundle or {}).get("people", [])
     locations = (bundle or {}).get("locations", [])
     events = (bundle or {}).get("event_suggestions", [])
+    all_people = merge_entity_pool(people, (bundle or {}).get("all_people", []))
+    all_locations = merge_entity_pool(locations, (bundle or {}).get("all_locations", []))
+    all_events = merge_entity_pool(events, (bundle or {}).get("all_events", []))
 
     document_date = normalize_document_date(briefing.get("document_date"), metadata)
     document_order = normalize_document_order(briefing.get("document_order"), metadata)
     primary_people = normalize_entity_refs(
         briefing.get("primary_people") or [],
-        people,
+        all_people,
         id_key="id",
         label_keys=("display_name", "alternate_names"),
     )
@@ -556,7 +562,7 @@ def build_source_navigation(page: dict[str, Any], bundle: dict[str, Any] | None 
 
     primary_locations = normalize_entity_refs(
         briefing.get("primary_locations") or [],
-        locations,
+        all_locations,
         id_key="id",
         label_keys=("name", "address_1886", "address_1887", "modern_address"),
     )
@@ -572,9 +578,24 @@ def build_source_navigation(page: dict[str, Any], bundle: dict[str, Any] | None 
             if location.get("id") or location.get("name")
         ]
 
-    referenced_events = normalize_event_refs(briefing.get("referenced_events") or [], events, people, locations)
+    raw_referenced_events = briefing.get("referenced_events") or []
+    raw_document_events = briefing.get("document_events") or []
+    if not raw_document_events:
+        raw_referenced_events, raw_document_events = split_document_event_refs(raw_referenced_events)
+
+    referenced_events = normalize_event_refs(
+        raw_referenced_events,
+        all_events,
+        all_people,
+        all_locations,
+    )
     if not referenced_events:
         referenced_events = [event_to_navigation_ref(event, people, locations) for event in events[:8]]
+    document_events = normalize_document_event_refs(
+        raw_document_events,
+        all_people,
+        all_locations,
+    )
 
     return {
         "brief_title": briefing.get("brief_title") or page.get("title"),
@@ -586,9 +607,11 @@ def build_source_navigation(page: dict[str, Any], bundle: dict[str, Any] | None 
         "primary_people": primary_people,
         "primary_locations": primary_locations,
         "referenced_events": referenced_events,
+        "document_events": document_events,
         "claim_count": len((bundle or {}).get("claims", [])),
         "event_reference_count": len(referenced_events),
-        "confidence": average_confidence([*primary_people, *primary_locations, *referenced_events]),
+        "document_event_count": len(document_events),
+        "confidence": average_confidence([*primary_people, *primary_locations, *referenced_events, *document_events]),
     }
 
 
@@ -607,11 +630,24 @@ def normalize_document_order(value: Any, metadata: dict[str, Any]) -> dict[str, 
     source = value if isinstance(value, dict) else {}
     page_start, page_end = parse_page_range(metadata.get("pages"))
     return {
-        "volume": source.get("volume") or metadata.get("volume"),
-        "page_start": source.get("page_start") if source.get("page_start") is not None else page_start,
-        "page_end": source.get("page_end") if source.get("page_end") is not None else page_end,
-        "sequence_label": source.get("sequence_label") or metadata.get("pages"),
+        "volume": metadata.get("volume") or source.get("volume"),
+        "page_start": page_start if page_start is not None else source.get("page_start"),
+        "page_end": page_end if page_end is not None else source.get("page_end"),
+        "sequence_label": metadata.get("pages") if page_start is not None else source.get("sequence_label"),
     }
+
+
+def merge_entity_pool(primary: list[dict[str, Any]], secondary: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for entity in [*primary, *secondary]:
+        entity_id = entity.get("id")
+        if entity_id and entity_id in seen:
+            continue
+        if entity_id:
+            seen.add(entity_id)
+        merged.append(entity)
+    return merged
 
 
 def normalize_entity_refs(
@@ -653,25 +689,121 @@ def normalize_event_refs(
         if event:
             item = event_to_navigation_ref(event, people, locations)
             item["supporting_quote"] = ref.get("supporting_quote")
-            item["page_refs"] = ref.get("page_refs") or item["page_refs"]
+            item["page_refs"] = normalize_page_refs(ref.get("page_refs") or item["page_refs"])
             normalized.append(item)
             continue
+        location = find_entity(ref.get("location_id"), ref.get("location_label"), locations, id_key="id", label_keys=("name", "address_1886", "address_1887", "modern_address"))
+        participant_ids = normalize_participant_ids(ref, people)
         normalized.append(
             {
                 "label": ref.get("label"),
                 "canonical_id": ref.get("canonical_id"),
-                "event_time": ref.get("event_time") or empty_event_time(),
-                "location_label": ref.get("location_label"),
-                "location_id": ref.get("location_id"),
+                "event_time": event_time_to_ref(ref.get("event_time") or {}),
+                "location_label": entity_label(location, ("name",)) if location else ref.get("location_label"),
+                "location_id": location.get("id") if location else ref.get("location_id"),
                 "participant_labels": ref.get("participant_labels") or [],
-                "participant_person_ids": ref.get("participant_person_ids") or [],
+                "participant_person_ids": participant_ids,
                 "summary": ref.get("summary") or "",
                 "supporting_quote": ref.get("supporting_quote"),
-                "page_refs": ref.get("page_refs") or [],
+                "page_refs": normalize_page_refs(ref.get("page_refs") or []),
                 "confidence": ref.get("confidence"),
             }
         )
     return [item for item in normalized if item.get("label")]
+
+
+def normalize_document_event_refs(
+    refs: list[Any],
+    people: list[dict[str, Any]],
+    locations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    normalized = []
+    for ref in refs:
+        if not isinstance(ref, dict):
+            continue
+        location = find_entity(ref.get("location_id"), ref.get("location_label"), locations, id_key="id", label_keys=("name", "address_1886", "address_1887", "modern_address"))
+        normalized.append(
+            {
+                "label": ref.get("label"),
+                "event_kind": ref.get("event_kind") or infer_document_event_kind(ref),
+                "event_time": event_time_to_ref(ref.get("event_time") or {}),
+                "location_label": entity_label(location, ("name",)) if location else ref.get("location_label"),
+                "location_id": location.get("id") if location else ref.get("location_id"),
+                "participant_labels": ref.get("participant_labels") or [],
+                "participant_person_ids": normalize_participant_ids(ref, people),
+                "summary": ref.get("summary") or "",
+                "supporting_quote": ref.get("supporting_quote"),
+                "page_refs": normalize_page_refs(ref.get("page_refs") or []),
+                "confidence": ref.get("confidence"),
+            }
+        )
+    return [item for item in normalized if item.get("label")]
+
+
+def split_document_event_refs(refs: list[Any]) -> tuple[list[Any], list[Any]]:
+    historical_refs: list[Any] = []
+    document_refs: list[Any] = []
+    for ref in refs:
+        if isinstance(ref, dict) and is_document_event_ref(ref):
+            document_refs.append(ref)
+        else:
+            historical_refs.append(ref)
+    return historical_refs, document_refs
+
+
+def is_document_event_ref(ref: dict[str, Any]) -> bool:
+    text = normalize_label(" ".join(str(ref.get(key) or "") for key in ("label", "summary")))
+    document_terms = (
+        "introduced into evidence",
+        "introduction of",
+        "publication",
+        "published",
+        "filing",
+        "filed",
+        "catalog",
+        "page copying",
+        "transcript",
+        "change of venue",
+        "petition",
+        "motion",
+        "order",
+        "arraignment",
+        "remand",
+        "grand jury presentment",
+        "empaneling",
+        "swearing of the cook county grand jury",
+    )
+    return any(term in text for term in document_terms)
+
+
+def infer_document_event_kind(ref: dict[str, Any]) -> str:
+    text = normalize_label(" ".join(str(ref.get(key) or "") for key in ("label", "summary")))
+    if any(term in text for term in ("publication", "published")):
+        return "publication"
+    if any(term in text for term in ("filing", "filed")):
+        return "filing"
+    if any(term in text for term in ("introduced into evidence", "introduction of", "exhibit")):
+        return "evidence_introduction"
+    if any(term in text for term in ("catalog", "page copying", "source", "transcript")):
+        return "source_description"
+    if any(term in text for term in ("petition", "motion", "order", "arraignment", "remand", "grand jury", "empaneling")):
+        return "court_procedure"
+    if any(term in text for term in ("created", "creation", "drawn", "made")):
+        return "document_creation"
+    return "other_document_event"
+
+
+def normalize_participant_ids(ref: dict[str, Any], people: list[dict[str, Any]]) -> list[str]:
+    ids: list[str] = []
+    for person_id in ref.get("participant_person_ids") or []:
+        if isinstance(person_id, str) and person_id and person_id not in ids:
+            ids.append(person_id)
+    for label in ref.get("participant_labels") or []:
+        person = find_entity(None, label, people, id_key="id", label_keys=("display_name", "alternate_names"))
+        person_id = person.get("id") if person else None
+        if person_id and person_id not in ids:
+            ids.append(person_id)
+    return ids
 
 
 def event_to_navigation_ref(
@@ -702,16 +834,53 @@ def event_to_navigation_ref(
 
 
 def event_time_to_ref(value: dict[str, Any]) -> dict[str, Any]:
+    start = value.get("start") or value.get("normalized_date")
     return {
-        "start": value.get("start"),
+        "start": start,
         "end": value.get("end"),
+        "normalized_date": str(start)[:10] if start else None,
         "precision": value.get("precision") or "unknown",
         "original_text": value.get("display") or value.get("original_text"),
     }
 
 
 def empty_event_time() -> dict[str, Any]:
-    return {"start": None, "end": None, "precision": "unknown", "original_text": None}
+    return {"start": None, "end": None, "normalized_date": None, "precision": "unknown", "original_text": None}
+
+
+def normalize_page_refs(values: list[Any]) -> list[str]:
+    normalized: list[str] = []
+    for value in values:
+        for page_ref in extract_page_refs(value):
+            if page_ref not in normalized:
+                normalized.append(page_ref)
+    return normalized
+
+
+def extract_page_refs(value: Any) -> list[str]:
+    text = str(value or "").strip()
+    if not text:
+        return []
+    refs = [
+        normalize_page_ref(match.group(1))
+        for match in re.finditer(
+            r"\b(?:pp?\.?|pages?|page)\s*([A-Z]?\s?\d+(?:\s+1/2)?)(?:\s*[-–]\s*[A-Z]?\s?\d+(?:\s+1/2)?)?",
+            text,
+            flags=re.I,
+        )
+    ]
+    if refs:
+        return refs
+    range_match = re.fullmatch(r"([A-Z]?\s?\d+(?:\s+1/2)?)\s*[-–]\s*[A-Z]?\s?\d+(?:\s+1/2)?", text, flags=re.I)
+    if range_match:
+        return [normalize_page_ref(range_match.group(1))]
+    if re.fullmatch(r"[A-Z]?\s?\d+(?:\s+1/2)?", text, flags=re.I):
+        return [normalize_page_ref(text)]
+    return [normalize_page_ref(text)]
+
+
+def normalize_page_ref(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip())
 
 
 def find_entity(
@@ -729,12 +898,13 @@ def find_entity(
     normalized_label = normalize_label(str(label or ""))
     if not normalized_label:
         return None
+    normalized_variants = label_variants(normalized_label)
     for entity in entities:
         labels: list[Any] = []
         for key in label_keys:
             value = entity.get(key)
             labels.extend(value if isinstance(value, list) else [value])
-        if any(normalize_label(str(candidate or "")) == normalized_label for candidate in labels):
+        if any(label_variants(normalize_label(str(candidate or ""))).intersection(normalized_variants) for candidate in labels):
             return entity
     return None
 
@@ -769,14 +939,34 @@ def infer_document_role(page: dict[str, Any]) -> str:
 
 
 def parse_page_range(value: Any) -> tuple[int | None, int | None]:
-    numbers = [int(match) for match in re.findall(r"\d+", str(value or ""))]
-    if not numbers:
+    text = str(value or "").strip()
+    if not text:
         return None, None
-    return numbers[0], numbers[-1]
+    range_match = re.search(r"([A-Z]?\s?\d+)(?:\s+1/2)?\s*[-–]\s*([A-Z]?\s?\d+)(?:\s+1/2)?", text, flags=re.I)
+    if range_match:
+        return page_ref_number(range_match.group(1)), page_ref_number(range_match.group(2))
+    single_match = re.fullmatch(r"[A-Z]?\s?\d+(?:\s+1/2)?", text, flags=re.I)
+    if single_match:
+        page = page_ref_number(text)
+        return page, page
+    return None, None
+
+
+def page_ref_number(value: Any) -> int | None:
+    match = re.search(r"\d+", str(value or ""))
+    return int(match.group(0)) if match else None
 
 
 def normalize_label(value: str) -> str:
     return re.sub(r"\s+", " ", value.strip().lower())
+
+
+def label_variants(value: str) -> set[str]:
+    variants = {value}
+    without_parenthetical = re.sub(r"\s*\([^)]*\)", "", value).strip()
+    if without_parenthetical:
+        variants.add(without_parenthetical)
+    return variants
 
 
 def parse_date_text(value: Any) -> str | None:

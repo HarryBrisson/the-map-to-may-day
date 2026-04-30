@@ -25,6 +25,8 @@ function renderNavigator() {
   document.getElementById("event-filter-wrap").hidden = state.activeView !== "sources";
   if (state.activeView === "events") {
     renderEventTimeline();
+  } else if (state.activeView === "document-events") {
+    renderDocumentEventTimeline();
   } else {
     renderSourceTimeline();
   }
@@ -59,6 +61,7 @@ function renderSourceCard(transcript) {
   const people = nav.primary_people || [];
   const locations = nav.primary_locations || [];
   const events = nav.referenced_events || [];
+  const documentEvents = nav.document_events || [];
   card.innerHTML = `
     <div class="document-card-main" role="button" tabindex="0" data-source-open="${escapeAttribute(transcript.id)}">
       <div>
@@ -76,7 +79,7 @@ function renderSourceCard(transcript) {
       <button type="button" class="text-button" data-source-toggle="${escapeAttribute(transcript.id)}">${expanded ? "Collapse" : "Expand"}</button>
       <button type="button" class="text-button" data-source-load="${escapeAttribute(transcript.id)}">Open Transcript</button>
     </div>
-    ${expanded ? renderSourceDetails(transcript, people, locations, events) : ""}
+    ${expanded ? renderSourceDetails(transcript, people, locations, events, documentEvents) : ""}
   `;
   card.querySelector("[data-source-open]").addEventListener("click", () => loadTranscript(transcript.id));
   card.querySelector("[data-source-open]").addEventListener("keydown", (event) => {
@@ -90,7 +93,7 @@ function renderSourceCard(transcript) {
   return card;
 }
 
-function renderSourceDetails(transcript, people, locations, events) {
+function renderSourceDetails(transcript, people, locations, events, documentEvents) {
   const nav = navigation(transcript);
   return `
     <div class="document-details">
@@ -102,6 +105,11 @@ function renderSourceDetails(transcript, people, locations, events) {
       <div class="support-list">
         ${events.length ? events.map((eventRef) => renderSourceEventRef(transcript, eventRef)).join("") : '<p class="muted">No referenced events in the brief yet.</p>'}
       </div>
+      ${documentEvents.length ? `
+        <div class="support-list">
+          ${documentEvents.map((eventRef) => renderSourceDocumentEventRef(transcript, eventRef)).join("")}
+        </div>
+      ` : ""}
       <p class="meta">${escapeHtml((nav.claim_count || 0).toString())} claims · ${escapeHtml(((transcript.source_stats || {}).mentions || 0).toString())} mentions</p>
     </div>
   `;
@@ -115,6 +123,21 @@ function renderSourceEventRef(transcript, eventRef) {
     <article class="support-card">
       <strong>${escapeHtml(eventRef.label || "Referenced event")}</strong>
       <div class="meta">${escapeHtml(eventMeta(eventRef))}</div>
+      ${eventRef.summary ? `<p>${escapeHtml(eventRef.summary)}</p>` : ""}
+      ${eventRef.supporting_quote ? `<blockquote>${escapeHtml(eventRef.supporting_quote)}</blockquote>` : ""}
+      <div class="chip-row">${pageButtons}</div>
+    </article>
+  `;
+}
+
+function renderSourceDocumentEventRef(transcript, eventRef) {
+  const pageButtons = (eventRef.page_refs || []).slice(0, 4).map((pageRef) => {
+    return `<button type="button" class="page-jump" data-source-page="${escapeAttribute(pageRef)}">p. ${escapeHtml(pageRef)}</button>`;
+  }).join("");
+  return `
+    <article class="support-card">
+      <strong>${escapeHtml(eventRef.label || "Document event")}</strong>
+      <div class="meta">${escapeHtml([eventKindLabel(eventRef.event_kind), eventMeta(eventRef)].filter(Boolean).join(" · "))}</div>
       ${eventRef.summary ? `<p>${escapeHtml(eventRef.summary)}</p>` : ""}
       ${eventRef.supporting_quote ? `<blockquote>${escapeHtml(eventRef.supporting_quote)}</blockquote>` : ""}
       <div class="chip-row">${pageButtons}</div>
@@ -141,6 +164,56 @@ function renderEventTimeline() {
     items.forEach((eventGroup) => section.appendChild(renderEventCard(eventGroup)));
     list.appendChild(section);
   });
+}
+
+function renderDocumentEventTimeline() {
+  const list = document.getElementById("transcript-list");
+  const count = document.getElementById("transcript-count");
+  const events = filteredDocumentEvents().sort(compareEventGroups);
+  count.textContent = `${events.length} document event${events.length === 1 ? "" : "s"} shown`;
+  list.innerHTML = "";
+
+  if (events.length === 0) {
+    list.innerHTML = '<p class="muted">No document events match the current filters.</p>';
+    return;
+  }
+
+  groupedBy(events, eventGroupKey).forEach((items, group) => {
+    const section = document.createElement("section");
+    section.className = "timeline-group";
+    section.innerHTML = `<h3>${escapeHtml(group)}</h3>`;
+    items.forEach((eventGroup) => section.appendChild(renderDocumentEventCard(eventGroup)));
+    list.appendChild(section);
+  });
+}
+
+function renderDocumentEventCard(eventGroup) {
+  const expanded = state.expandedEvents.has(eventGroup.key);
+  const card = document.createElement("article");
+  card.className = "document-card event-document-card";
+  card.innerHTML = `
+    <div class="document-card-main" role="button" tabindex="0" data-event-toggle="${escapeAttribute(eventGroup.key)}">
+      <div>
+        <h4>${escapeHtml(eventGroup.label)}</h4>
+        <div class="meta">${escapeHtml([eventKindLabel(eventGroup.event_kind), eventMeta(eventGroup)].filter(Boolean).join(" · "))}</div>
+      </div>
+      <span class="count-chip">${eventGroup.sources.length} source${eventGroup.sources.length === 1 ? "" : "s"}</span>
+    </div>
+    <p>${escapeHtml(eventGroup.summary || "")}</p>
+    <div class="chip-row">
+      ${renderChip(eventGroup.location_label, "location")}
+      ${(eventGroup.participant_labels || []).slice(0, 4).map((label) => renderChip(label, "person")).join("")}
+    </div>
+    ${expanded ? renderEventSupport(eventGroup) : ""}
+  `;
+  card.querySelector("[data-event-toggle]").addEventListener("click", () => toggleEvent(eventGroup.key));
+  card.querySelector("[data-event-toggle]").addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") toggleEvent(eventGroup.key);
+  });
+  card.querySelectorAll("[data-support-source]").forEach((button) => {
+    button.addEventListener("click", () => loadTranscript(button.dataset.supportSource, button.dataset.supportPage || null));
+  });
+  return card;
 }
 
 function renderEventCard(eventGroup) {
@@ -204,6 +277,7 @@ function sourceMatches(transcript, filters, options = {}) {
     ...(nav.primary_people || []).map((item) => item.label),
     ...(nav.primary_locations || []).map((item) => item.label),
     ...(nav.referenced_events || []).map((item) => item.label),
+    ...(nav.document_events || []).map((item) => item.label),
   ].join(" ").toLowerCase();
   if (filters.query && !haystack.includes(filters.query)) return false;
   if (filters.sourceType && transcript.source_type !== filters.sourceType) return false;
@@ -225,6 +299,24 @@ function filteredEvents() {
       const eventDate = ((ref.event_time || {}).start || "").slice(0, 10);
       if (!dateInRange(eventDate || null, filters.startDate, filters.endDate)) return;
       const key = eventKey(ref);
+      if (!groups.has(key)) {
+        groups.set(key, { ...ref, key, sources: [] });
+      }
+      groups.get(key).sources.push({ source, ref });
+    });
+  });
+  return Array.from(groups.values());
+}
+
+function filteredDocumentEvents() {
+  const filters = readFilters();
+  const sourcePool = state.transcripts.filter((source) => sourceMatches(source, filters, { skipSourceDates: true }));
+  const groups = new Map();
+  sourcePool.forEach((source) => {
+    (navigation(source).document_events || []).forEach((ref) => {
+      const eventDate = ((ref.event_time || {}).start || "").slice(0, 10);
+      if (!dateInRange(eventDate || null, filters.startDate, filters.endDate)) return;
+      const key = documentEventKey(ref);
       if (!groups.has(key)) {
         groups.set(key, { ...ref, key, sources: [] });
       }
@@ -473,6 +565,14 @@ function dateInRange(value, start, end) {
 
 function eventKey(ref) {
   return ref.canonical_id || `${((ref.event_time || {}).start || "undated").slice(0, 10)}|${normalizeText(ref.label)}|${normalizeText(ref.location_label)}`;
+}
+
+function documentEventKey(ref) {
+  return `${((ref.event_time || {}).start || "undated").slice(0, 10)}|${normalizeText(ref.event_kind)}|${normalizeText(ref.label)}|${normalizeText(ref.location_label)}`;
+}
+
+function eventKindLabel(value) {
+  return String(value || "").replaceAll("_", " ");
 }
 
 function normalizeText(value) {

@@ -21,6 +21,7 @@
     "primary_people",
     "primary_locations",
     "referenced_events",
+    "document_events",
     "speaker_directory"
   ],
   "properties": {
@@ -126,6 +127,59 @@
         "properties": {
           "label": { "type": "string" },
           "canonical_id": { "type": ["string", "null"] },
+          "event_time": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["start", "end", "precision", "original_text"],
+            "properties": {
+              "start": { "type": ["string", "null"] },
+              "end": { "type": ["string", "null"] },
+              "precision": { "type": "string" },
+              "original_text": { "type": ["string", "null"] }
+            }
+          },
+          "location_label": { "type": ["string", "null"] },
+          "location_id": { "type": ["string", "null"] },
+          "participant_labels": { "type": "array", "items": { "type": "string" } },
+          "participant_person_ids": { "type": "array", "items": { "type": "string" } },
+          "summary": { "type": "string" },
+          "supporting_quote": { "type": ["string", "null"] },
+          "page_refs": { "type": "array", "items": { "type": "string" } },
+          "confidence": { "type": "number" }
+        }
+      }
+    },
+    "document_events": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "label",
+          "event_kind",
+          "event_time",
+          "location_label",
+          "location_id",
+          "participant_labels",
+          "participant_person_ids",
+          "summary",
+          "supporting_quote",
+          "page_refs",
+          "confidence"
+        ],
+        "properties": {
+          "label": { "type": "string" },
+          "event_kind": {
+            "enum": [
+              "publication",
+              "filing",
+              "court_procedure",
+              "evidence_introduction",
+              "document_creation",
+              "source_description",
+              "other_document_event"
+            ]
+          },
           "event_time": {
             "type": "object",
             "additionalProperties": false,
