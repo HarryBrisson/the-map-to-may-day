@@ -55,7 +55,7 @@ Update only the source/document briefs used by the transcript navigator, without
 python pipeline/main.py --action briefs --corpus full --output local --briefing-model gpt-5-mini --max-brief-workers 32
 ```
 
-Use `--pages source_hadc_i019_052` to update a small subset first. Brief updates resume by default when rerun with the same `--run-id`: successful per-page `briefing.json` audit files are reused and only missing/failed pages call the model. Pass `--no-resume-briefs` to force regeneration.
+Use `--pages source_hadc_i019_052` to update a small subset first. Brief updates resume by default when rerun with the same `--run-id`: successful per-page `briefing.json` audit files are reused and only missing/failed pages call the model. Across run IDs, briefs also use a durable cache keyed by source text hash, briefing model, prompt template, and schema digest. Pass `--fresh-briefs` to ignore both resume files and the durable brief cache, generate fresh briefs, and leave existing cache entries untouched.
 
 Optionally geocode the unique LLM-extracted locations. This first asks the LLM for a modern Google Maps query/address, then calls the Google Maps Geocoding API once per unique `location.id`:
 

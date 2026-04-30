@@ -174,7 +174,8 @@ def parse_args() -> argparse.Namespace:
             "Skip the page-level bundle cache. Default: cached bundles for pages with the same "
             "config (models, prompts, source-text hash) are reused, and successful new bundles "
             "are written to data/cache/haymarket/. Pass --no-cache to force every page to re-run "
-            "all three stages and not write back to the cache."
+            "all three stages and not write back to the cache. For --action briefs, this also "
+            "skips the durable brief cache."
         ),
     )
     parser.add_argument(
@@ -183,13 +184,21 @@ def parse_args() -> argparse.Namespace:
         help=(
             "For --action briefs, ignore successful briefing audit files already written under "
             "the same --run-id and call the model again. By default, brief updates resume and "
-            "reuse successful per-page briefs."
+            "reuse successful per-page briefs before checking the durable brief cache."
+        ),
+    )
+    parser.add_argument(
+        "--fresh-briefs",
+        action="store_true",
+        help=(
+            "For --action briefs, ignore same-run resume files and the durable brief cache, "
+            "call the model again, and do not overwrite matching cached briefs."
         ),
     )
     parser.add_argument(
         "--clear-cache",
         action="store_true",
-        help="Wipe data/cache/haymarket/ before running (separate from --clear-data).",
+        help="Wipe durable Haymarket bundle and brief caches before running (separate from --clear-data).",
     )
     parser.add_argument("--geocode", action="store_true", help="Run geolocation after enrichment")
     parser.add_argument("--geocoder", choices=["google"], default="google")
@@ -213,8 +222,12 @@ def print_cache_status(data_dir: str) -> None:
         return
 
     print(f"Cache: {base}")
-    print(f"  {len(inventory['configs'])} config(s), {inventory['total_pages']} cached page(s), "
-          f"${inventory['total_cost_usd']:.4f} of producer cost")
+    print(
+        f"  {len(inventory['configs'])} bundle config(s), "
+        f"{len(inventory.get('brief_configs', []))} brief config(s), "
+        f"{inventory['total_pages']} cached page(s), "
+        f"${inventory['total_cost_usd']:.4f} of producer cost"
+    )
     for cfg in inventory["configs"]:
         config = cfg["config"] or {}
         config_summary = (
@@ -227,6 +240,24 @@ def print_cache_status(data_dir: str) -> None:
             f"({cfg['page_count']} page(s), ${cfg['cost_usd']:.4f})"
         )
         print(f"    {config_summary}")
+        for entry in cfg["pages"]:
+            produced = (entry.get("produced_at") or "")[:19].replace("T", " ")
+            run_label = entry.get("produced_by_run_id") or "?"
+            print(
+                f"    - {entry['page_id']:35s}  ${entry['cost_usd']:>7.4f}  "
+                f"{produced}  by {run_label}"
+            )
+    for cfg in inventory.get("brief_configs", []):
+        config = cfg["config"] or {}
+        print(
+            f"\n  brief config {cfg['cache_key']}  "
+            f"({cfg['page_count']} page(s), ${cfg['cost_usd']:.4f})"
+        )
+        print(
+            f"    briefing={config.get('briefing_model', '?')}  "
+            f"prompt={config.get('briefing_prompt_template', '?')}  "
+            f"schema={config.get('briefing_schema_digest', '?')}"
+        )
         for entry in cfg["pages"]:
             produced = (entry.get("produced_at") or "")[:19].replace("T", " ")
             run_label = entry.get("produced_by_run_id") or "?"
@@ -307,13 +338,16 @@ def main() -> None:
                 briefing_model=args.briefing_model,
                 streaming=not args.no_streaming,
                 page_filter=args.pages,
-                resume=not args.no_resume_briefs,
+                resume=(not args.no_resume_briefs and not args.fresh_briefs),
                 max_brief_workers=args.max_brief_workers,
+                use_brief_cache=(not args.no_cache and not args.fresh_briefs),
+                write_brief_cache=(not args.no_cache and not args.fresh_briefs),
             )
             print(
                 "Updated source briefs: "
                 f"{result['briefings']} of {result['pages']} page(s) briefed, "
                 f"{result['reused']} reused, "
+                f"{result['cache_hits']} durable cache hit(s), "
                 f"{result['skipped']} skipped, "
                 f"{len(result['sources'])} source navigation records written"
             )

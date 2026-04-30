@@ -50,6 +50,28 @@ def test_briefing_schema_matches_strict_response_format_subset() -> None:
     assert_openai_strict_schema(schema)
 
 
+def test_briefing_log_label_matches_document_role() -> None:
+    testimony = {
+        "document_role": "testimony",
+        "witness": {"name": "John Bonfield", "role": "police"},
+        "brief_title": "Bonfield testimony",
+    }
+    exhibit = {
+        "document_role": "exhibit",
+        "witness": {"name": "Harry Wilkinson", "role": "witness"},
+        "brief_title": "People's Exhibit 13 — Chicago Daily News map",
+    }
+    procedural = {
+        "document_role": "procedural",
+        "witness": {"name": None, "role": None},
+        "brief_title": "Petition for change of venue",
+    }
+
+    assert stage_briefing.briefing_log_label({"source_type": "testimony"}, testimony) == "witness=John Bonfield"
+    assert stage_briefing.briefing_log_label({"source_type": "exhibit"}, exhibit).startswith("exhibit=People's Exhibit 13")
+    assert stage_briefing.briefing_log_label({"source_type": "document"}, procedural) == "procedural=Petition for change of venue"
+
+
 def test_page_cache_hit_skips_all_three_stages(tmp_path, monkeypatch) -> None:
     """Two-pass test: first run populates cache, second run reads from it."""
     from utils.page_cache import compute_cache_key, write_cached_bundle, read_cached_bundle
@@ -707,6 +729,92 @@ def test_run_brief_update_writes_source_navigation_without_transcription(tmp_pat
     assert source["navigation"]["brief_title"] == "Bonfield testimony"
     assert source["navigation"]["document_date"]["normalized_date"] == "1886-07-16"
     assert source["navigation"]["primary_people"][0]["canonical_id"] == "person_john_bonfield"
+
+
+def test_run_brief_update_uses_durable_brief_cache_across_run_ids(tmp_path, monkeypatch) -> None:
+    storage = LocalJsonStorage(tmp_path)
+    source_id = "source_hadc_i019_052"
+    page = {
+        "id": source_id,
+        "url": "https://example.test/I019-052.htm",
+        "title": "Testimony of John Bonfield",
+        "source_type": "testimony",
+        "fetched_at": "2026-04-27T00:00:00+00:00",
+        "raw_html_sha256": "abc123",
+        "candidate_text_sha256": "candidate123",
+        "raw_html_path": "raw.html",
+        "candidate_text_path": "text.txt",
+        "tei_path": "tei.xml",
+        "transcript_json_path": "transcript.json",
+        "text": "John Bonfield testified on July 16, 1886.",
+        "links": [],
+        "page_images": [],
+        "page_cues": [],
+        "transcript_metadata": {"volume": "I", "pages": "19-52", "date_text": "1886 July 16"},
+        "source_stats": {"characters": 42, "lines": 1},
+    }
+    for run_id in ["brief_cache_first", "brief_cache_second"]:
+        storage.write_json(f"raw/haymarket/hadc/{run_id}/pages.json", [page])
+    for dataset in ["people", "locations", "claims", "events"]:
+        storage.write_json(f"enriched/haymarket/{dataset}/latest.json", [])
+
+    briefing = {
+        "source_id": source_id,
+        "summary": "Bonfield testimony.",
+        "brief_title": "Bonfield cached by config",
+        "navigation_summary": "Bonfield gives testimony for the prosecution.",
+        "document_date": {"original_text": "1886 July 16", "normalized_date": "1886-07-16", "precision": "day"},
+        "document_order": {"volume": "I", "page_start": 19, "page_end": 52, "sequence_label": "19-52"},
+        "document_role": "testimony",
+        "witness": {"name": "John Bonfield", "role": "police"},
+        "examiners": [],
+        "defendants_referenced": [],
+        "key_locations": [],
+        "key_dates": [],
+        "topics": [],
+        "primary_people": [],
+        "primary_locations": [],
+        "referenced_events": [],
+        "document_events": [],
+        "speaker_directory": [{"speaker_id": "#bonfield", "display_name": "John Bonfield", "role": "witness"}],
+    }
+    calls = {"count": 0}
+
+    def structured_response(model, input_messages, schema, schema_name, max_output_tokens=None, reasoning_effort=None):
+        del model, input_messages, schema, schema_name, max_output_tokens, reasoning_effort
+        calls["count"] += 1
+        return briefing, {"output": "structured"}, {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+
+    monkeypatch.setattr(stage_briefing, "call_openai_structured", structured_response)
+    first = run_brief_update(
+        storage=storage,
+        run_id="brief_cache_first",
+        corpus="test",
+        briefing_model="gpt-5-mini",
+        streaming=False,
+    )
+    assert first["cache_hits"] == 0
+    assert calls["count"] == 1
+
+    def fail_if_called(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("second run should use durable brief cache")
+
+    monkeypatch.setattr(stage_briefing, "call_openai_structured", fail_if_called)
+    second = run_brief_update(
+        storage=storage,
+        run_id="brief_cache_second",
+        corpus="test",
+        briefing_model="gpt-5-mini",
+        streaming=False,
+    )
+
+    assert second["cache_hits"] == 1
+    assert second["reused"] == 1
+    assert second["cost_usd"] == 0
+    assert storage.exists(f"raw/haymarket/llm/brief_cache_second/gpt_5_mini/{source_id}/briefing.json")
+    source = storage.read_json("enriched/haymarket/sources/latest.json")[0]
+    assert source["navigation"]["brief_title"] == "Bonfield cached by config"
 
 
 def test_run_brief_update_reuses_successful_briefs_on_resume(tmp_path, monkeypatch) -> None:

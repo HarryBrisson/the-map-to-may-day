@@ -90,10 +90,8 @@ def run_briefing(
     storage.write_json(audit_path, audit)
 
     if status == "success":
-        witness = (parsed or {}).get("witness") or {}
-        witness_name = witness.get("name") or "—"
         progress.done(
-            f"witness={witness_name}, ${cost_usd:.4f}",
+            f"{briefing_log_label(page, parsed)}, ${cost_usd:.4f}",
             duration_s=duration,
         )
     else:
@@ -169,6 +167,26 @@ def build_briefing_messages(page: dict[str, Any]) -> list[dict[str, str]]:
 
 def load_briefing_schema() -> dict[str, Any]:
     return load_schema_with_refs("briefing.schema.json")
+
+
+def briefing_log_label(page: dict[str, Any], briefing: dict[str, Any] | None) -> str:
+    briefing = briefing or {}
+    role = str(briefing.get("document_role") or page.get("source_type") or "source").strip()
+    witness = briefing.get("witness") if isinstance(briefing.get("witness"), dict) else {}
+    witness_name = (witness or {}).get("name")
+    if role == "testimony":
+        return f"witness={witness_name or '—'}"
+
+    title = str(briefing.get("brief_title") or page.get("title") or "").strip()
+    title = compact_log_text(title)
+    return f"{role}={title or page.get('id') or '—'}"
+
+
+def compact_log_text(value: str, max_length: int = 72) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= max_length:
+        return text
+    return text[: max_length - 1].rstrip() + "…"
 
 
 def normalize_speaker_directory(briefing: dict[str, Any] | None) -> None:

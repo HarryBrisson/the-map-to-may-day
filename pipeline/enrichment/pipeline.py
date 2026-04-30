@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -8,10 +10,11 @@ from typing import Any
 from enrichment.harmonization import harmonize_bundles
 from enrichment.llm_extraction import extract_pages_with_audit
 from enrichment.schema_validation import validate_items
-from enrichment.stage_briefing import run_briefing
+from enrichment.stage_briefing import BRIEFING_PROMPT_TEMPLATE, load_briefing_schema, run_briefing
 from enrichment.progress import StageProgress
 from sources.hadc_source import add_standoff_annotations_to_tei, tei_to_transcript_json
 from utils.ids import slugify
+from utils.page_cache import compute_brief_cache_key, read_cached_brief, write_cached_brief
 from utils.s3_storage import JsonStorage
 
 
@@ -150,6 +153,8 @@ def run_brief_update(
     page_filter: list[str] | None = None,
     resume: bool = True,
     max_brief_workers: int = 1,
+    use_brief_cache: bool = True,
+    write_brief_cache: bool = True,
 ) -> dict[str, Any]:
     pages = load_pages(storage, run_id)
     if page_filter:
@@ -169,10 +174,12 @@ def run_brief_update(
     total_cost = 0.0
     total_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "reasoning_tokens": 0, "cached_input_tokens": 0}
     reused = 0
+    cache_hits = 0
     pages_to_brief = [page for page in pages if page.get("source_type") != "toc"]
     for page in pages:
         if page.get("source_type") == "toc":
             print(f"Skipping brief update for {page['id']} (source_type=toc)")
+    schema_digest = briefing_schema_digest()
 
     def brief_page(page: dict[str, Any]) -> dict[str, Any]:
         cached_audit = read_successful_brief_audit(storage, run_id, briefing_model, page["id"]) if resume else None
@@ -180,6 +187,31 @@ def run_brief_update(
             result = briefing_result_from_audit(cached_audit, run_id, briefing_model, page["id"])
             StageProgress(page["id"], "briefing", enabled=streaming).info("reused existing successful brief")
             result["reused"] = True
+            result["cache_hit"] = False
+            return result
+        brief_cache_key = compute_brief_cache_key(
+            page,
+            briefing_model=briefing_model,
+            briefing_prompt_template=BRIEFING_PROMPT_TEMPLATE,
+            briefing_schema_digest=schema_digest,
+        )
+        cached_brief = read_cached_brief(storage, brief_cache_key, page["id"]) if use_brief_cache else None
+        if cached_brief:
+            briefing, metadata = cached_brief
+            StageProgress(page["id"], "briefing", enabled=streaming).info(
+                f"cache hit ({brief_cache_key[:8]}, saved ${metadata.get('cost_usd', 0):.4f})"
+            )
+            result = briefing_result_from_cached_brief(
+                briefing=briefing,
+                metadata=metadata,
+                run_id=run_id,
+                model=briefing_model,
+                page_id=page["id"],
+                cache_key=brief_cache_key,
+            )
+            result["reused"] = True
+            result["cache_hit"] = True
+            storage.write_json(result["audit_path"], result["audit"])
             return result
         result = run_briefing(
             page=page,
@@ -189,6 +221,26 @@ def run_brief_update(
             progress=StageProgress(page["id"], "briefing", enabled=streaming),
         )
         result["reused"] = False
+        result["cache_hit"] = False
+        if (
+            write_brief_cache
+            and result["status"] == "success"
+            and result.get("briefing")
+        ):
+            write_cached_brief(
+                storage,
+                brief_cache_key,
+                page["id"],
+                result["briefing"],
+                run_id=run_id,
+                config={
+                    "briefing_model": briefing_model,
+                    "briefing_prompt_template": BRIEFING_PROMPT_TEMPLATE,
+                    "briefing_schema_digest": schema_digest,
+                },
+                cost_usd=result.get("cost_usd") or 0.0,
+                usage=result.get("usage") or {},
+            )
         return result
 
     max_workers = max(1, int(max_brief_workers or 1))
@@ -201,6 +253,8 @@ def run_brief_update(
             result = future.result()
             if result.get("reused"):
                 reused += 1
+            if result.get("cache_hit"):
+                cache_hits += 1
             if result.get("audit") is None:
                 raise RuntimeError(f"Briefing produced no audit record for {page['id']}")
             audit_records.append(result["audit"])
@@ -245,6 +299,7 @@ def run_brief_update(
         "pages": len(pages_to_brief),
         "skipped": len(pages) - len(pages_to_brief),
         "reused": reused,
+        "cache_hits": cache_hits,
         "audit_records": audit_records,
         "cost_usd": round(total_cost, 8),
         "usage": total_usage,
@@ -278,12 +333,60 @@ def briefing_result_from_audit(audit: dict[str, Any], run_id: str, model: str, p
     }
 
 
+def briefing_result_from_cached_brief(
+    *,
+    briefing: dict[str, Any],
+    metadata: dict[str, Any],
+    run_id: str,
+    model: str,
+    page_id: str,
+    cache_key: str,
+) -> dict[str, Any]:
+    audit = {
+        "run_id": run_id,
+        "page_id": page_id,
+        "stage": "briefing",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "provider": "openai",
+        "model": model,
+        "prompt_template": BRIEFING_PROMPT_TEMPLATE,
+        "input_messages": [],
+        "raw_output": None,
+        "parsed_output": briefing,
+        "usage": zero_usage(),
+        "cost_usd": 0.0,
+        "status": "success",
+        "error": None,
+        "duration_s": 0.0,
+        "cache": {
+            "cache_key": cache_key,
+            "produced_by_run_id": metadata.get("produced_by_run_id"),
+            "produced_at": metadata.get("produced_at"),
+            "saved_cost_usd": metadata.get("cost_usd", 0.0),
+        },
+    }
+    return {
+        "briefing": briefing,
+        "audit": audit,
+        "usage": zero_usage(),
+        "cost_usd": 0.0,
+        "status": "cached",
+        "error": None,
+        "audit_path": brief_audit_path(run_id, model, page_id),
+    }
+
+
 def brief_audit_path(run_id: str, model: str, page_id: str) -> str:
     return f"raw/haymarket/llm/{run_id}/{slugify(model)}/{page_id}/briefing.json"
 
 
 def zero_usage() -> dict[str, int]:
     return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "reasoning_tokens": 0, "cached_input_tokens": 0}
+
+
+def briefing_schema_digest() -> str:
+    schema_json = json.dumps(load_briefing_schema(), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(schema_json.encode("utf-8")).hexdigest()[:16]
 
 
 def brief_navigation_bundle(

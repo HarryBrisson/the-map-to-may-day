@@ -26,6 +26,7 @@ from utils.s3_storage import JsonStorage
 
 
 CACHE_PREFIX = "cache/haymarket"
+BRIEF_CACHE_PREFIX = "cache/haymarket_briefs"
 
 
 def compute_cache_key(
@@ -60,10 +61,35 @@ def compute_cache_key(
     return hashlib.sha256(fingerprint).hexdigest()[:16]
 
 
+def compute_brief_cache_key(
+    page: dict[str, Any],
+    *,
+    briefing_model: str,
+    briefing_prompt_template: str,
+    briefing_schema_digest: str,
+) -> str:
+    parts = [
+        page.get("candidate_text_sha256") or page.get("id", ""),
+        briefing_model,
+        briefing_prompt_template,
+        briefing_schema_digest,
+    ]
+    fingerprint = "|".join(str(p) for p in parts).encode("utf-8")
+    return hashlib.sha256(fingerprint).hexdigest()[:16]
+
+
 def cache_paths(cache_key: str, page_id: str) -> dict[str, str]:
     base = f"{CACHE_PREFIX}/{cache_key}/{page_id}"
     return {
         "bundle": f"{base}/bundle.json",
+        "metadata": f"{base}/metadata.json",
+    }
+
+
+def brief_cache_paths(cache_key: str, page_id: str) -> dict[str, str]:
+    base = f"{BRIEF_CACHE_PREFIX}/{cache_key}/{page_id}"
+    return {
+        "briefing": f"{base}/briefing.json",
         "metadata": f"{base}/metadata.json",
     }
 
@@ -120,9 +146,48 @@ def write_cached_bundle(
     return paths
 
 
+def read_cached_brief(
+    storage: JsonStorage,
+    cache_key: str,
+    page_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    paths = brief_cache_paths(cache_key, page_id)
+    if not storage.exists(paths["briefing"]):
+        return None
+    if not storage.exists(paths["metadata"]):
+        return None
+    return storage.read_json(paths["briefing"]), storage.read_json(paths["metadata"])
+
+
+def write_cached_brief(
+    storage: JsonStorage,
+    cache_key: str,
+    page_id: str,
+    briefing: dict[str, Any],
+    *,
+    run_id: str,
+    config: dict[str, Any],
+    cost_usd: float,
+    usage: dict[str, Any],
+) -> dict[str, str]:
+    paths = brief_cache_paths(cache_key, page_id)
+    metadata = {
+        "cache_key": cache_key,
+        "page_id": page_id,
+        "produced_at": datetime.now(timezone.utc).isoformat(),
+        "produced_by_run_id": run_id,
+        "config": config,
+        "cost_usd": round(float(cost_usd), 8),
+        "usage": dict(usage),
+    }
+    storage.write_json(paths["briefing"], briefing)
+    storage.write_json(paths["metadata"], metadata)
+    return paths
+
+
 def clear_cache(storage: JsonStorage) -> int:
     """Wipe the entire haymarket cache. Returns file count cleared."""
-    return storage.clear_prefix(CACHE_PREFIX)
+    return storage.clear_prefix(CACHE_PREFIX) + storage.clear_prefix(BRIEF_CACHE_PREFIX)
 
 
 def cache_inventory(data_dir) -> dict[str, Any]:
@@ -135,53 +200,95 @@ def cache_inventory(data_dir) -> dict[str, Any]:
     from pathlib import Path
 
     base = Path(data_dir) / CACHE_PREFIX
-    if not base.exists():
-        return {"base_path": str(base), "configs": [], "total_pages": 0, "total_cost_usd": 0.0}
 
     configs: list[dict[str, Any]] = []
+    brief_configs: list[dict[str, Any]] = []
     total_cost = 0.0
     total_pages = 0
 
-    for cfg_dir in sorted(p for p in base.iterdir() if p.is_dir()):
-        entries: list[dict[str, Any]] = []
-        cfg_cost = 0.0
-        cfg_config: dict[str, Any] | None = None
-        for page_dir in sorted(p for p in cfg_dir.iterdir() if p.is_dir()):
-            metadata_path = page_dir / "metadata.json"
-            bundle_path = page_dir / "bundle.json"
-            if not metadata_path.exists() or not bundle_path.exists():
-                continue
-            try:
-                metadata = json.loads(metadata_path.read_text())
-            except Exception:
-                continue
-            cost = float(metadata.get("cost_usd") or 0.0)
-            cfg_cost += cost
-            total_cost += cost
-            total_pages += 1
-            entries.append(
-                {
-                    "page_id": page_dir.name,
-                    "produced_at": metadata.get("produced_at"),
-                    "produced_by_run_id": metadata.get("produced_by_run_id"),
-                    "cost_usd": round(cost, 8),
-                }
-            )
-            if cfg_config is None:
-                cfg_config = metadata.get("config") or {}
-        configs.append(
-            {
-                "cache_key": cfg_dir.name,
-                "config": cfg_config or {},
-                "page_count": len(entries),
-                "cost_usd": round(cfg_cost, 8),
-                "pages": entries,
-            }
-        )
+    if base.exists():
+        for cfg_dir in sorted(p for p in base.iterdir() if p.is_dir()):
+            entries: list[dict[str, Any]] = []
+            cfg_cost = 0.0
+            cfg_config: dict[str, Any] | None = None
+            for page_dir in sorted(p for p in cfg_dir.iterdir() if p.is_dir()):
+                metadata_path = page_dir / "metadata.json"
+                bundle_path = page_dir / "bundle.json"
+                if not metadata_path.exists() or not bundle_path.exists():
+                    continue
+                try:
+                    metadata = json.loads(metadata_path.read_text())
+                except Exception:
+                    continue
+                cost = float(metadata.get("cost_usd") or 0.0)
+                cfg_cost += cost
+                total_cost += cost
+                total_pages += 1
+                entries.append(
+                    {
+                        "page_id": page_dir.name,
+                        "produced_at": metadata.get("produced_at"),
+                        "produced_by_run_id": metadata.get("produced_by_run_id"),
+                        "cost_usd": round(cost, 8),
+                    }
+                )
+                if cfg_config is None:
+                    cfg_config = metadata.get("config") or {}
+            if entries:
+                configs.append(
+                    {
+                        "cache_key": cfg_dir.name,
+                        "config": cfg_config or {},
+                        "page_count": len(entries),
+                        "cost_usd": round(cfg_cost, 8),
+                        "pages": entries,
+                    }
+                )
+
+    brief_base = Path(data_dir) / BRIEF_CACHE_PREFIX
+    if brief_base.exists():
+        for cfg_dir in sorted(p for p in brief_base.iterdir() if p.is_dir()):
+            entries = []
+            cfg_cost = 0.0
+            cfg_config = None
+            for page_dir in sorted(p for p in cfg_dir.iterdir() if p.is_dir()):
+                metadata_path = page_dir / "metadata.json"
+                briefing_path = page_dir / "briefing.json"
+                if not metadata_path.exists() or not briefing_path.exists():
+                    continue
+                try:
+                    metadata = json.loads(metadata_path.read_text())
+                except Exception:
+                    continue
+                cost = float(metadata.get("cost_usd") or 0.0)
+                cfg_cost += cost
+                total_cost += cost
+                total_pages += 1
+                entries.append(
+                    {
+                        "page_id": page_dir.name,
+                        "produced_at": metadata.get("produced_at"),
+                        "produced_by_run_id": metadata.get("produced_by_run_id"),
+                        "cost_usd": round(cost, 8),
+                    }
+                )
+                if cfg_config is None:
+                    cfg_config = metadata.get("config") or {}
+            if entries:
+                brief_configs.append(
+                    {
+                        "cache_key": cfg_dir.name,
+                        "config": cfg_config or {},
+                        "page_count": len(entries),
+                        "cost_usd": round(cfg_cost, 8),
+                        "pages": entries,
+                    }
+                )
 
     return {
         "base_path": str(base),
         "configs": configs,
+        "brief_configs": brief_configs,
         "total_pages": total_pages,
         "total_cost_usd": round(total_cost, 8),
     }
