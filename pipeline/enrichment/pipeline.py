@@ -7,10 +7,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any
 
+from enrichment.brief_harmonization import run_brief_harmonization
 from enrichment.harmonization import harmonize_bundles
 from enrichment.llm_extraction import extract_pages_with_audit
 from enrichment.schema_validation import validate_items
-from enrichment.stage_briefing import BRIEFING_PROMPT_TEMPLATE, load_briefing_schema, run_briefing
+from enrichment.stage_briefing import BRIEFING_PROMPT_TEMPLATE, DEFAULT_BRIEFING_ATTEMPTS, load_briefing_schema, run_briefing
 from enrichment.progress import StageProgress
 from sources.hadc_source import add_standoff_annotations_to_tei, tei_to_transcript_json
 from utils.ids import slugify
@@ -30,6 +31,7 @@ def run_enrichment(
     max_tagging_unit_attempts: int = 3,
     streaming: bool = True,
     page_filter: list[str] | None = None,
+    max_briefing_attempts: int = DEFAULT_BRIEFING_ATTEMPTS,
     max_transcription_attempts: int = 2,
     transcription_format: str = "tei",
     use_cache: bool = True,
@@ -52,6 +54,7 @@ def run_enrichment(
         max_tagging_workers=max_tagging_workers,
         max_tagging_unit_attempts=max_tagging_unit_attempts,
         streaming=streaming,
+        max_briefing_attempts=max_briefing_attempts,
         max_transcription_attempts=max_transcription_attempts,
         transcription_format=transcription_format,
         use_cache=use_cache,
@@ -153,8 +156,10 @@ def run_brief_update(
     page_filter: list[str] | None = None,
     resume: bool = True,
     max_brief_workers: int = 1,
+    max_briefing_attempts: int = DEFAULT_BRIEFING_ATTEMPTS,
     use_brief_cache: bool = True,
     write_brief_cache: bool = True,
+    harmonize_briefs: bool = True,
 ) -> dict[str, Any]:
     pages = load_pages(storage, run_id)
     if page_filter:
@@ -219,6 +224,7 @@ def run_brief_update(
             run_id=run_id,
             model=briefing_model,
             progress=StageProgress(page["id"], "briefing", enabled=streaming),
+            max_attempts=max_briefing_attempts,
         )
         result["reused"] = False
         result["cache_hit"] = False
@@ -264,10 +270,25 @@ def run_brief_update(
             if result["status"] in {"success", "cached"}:
                 briefings_by_source[page["id"]] = result["briefing"] or {}
 
+    harmonization_result = None
+    harmonized_briefings_by_source: dict[str, dict[str, Any]] = {}
+    if harmonize_briefs:
+        harmonization_result = run_brief_harmonization(
+            storage=storage,
+            pages=pages,
+            briefings_by_source=briefings_by_source,
+            run_id=run_id,
+            people=existing_people,
+            locations=existing_locations,
+            events=existing_events,
+        )
+        harmonized_briefings_by_source = harmonization_result["briefings_by_source"]
+
     bundles = [
         brief_navigation_bundle(
             page=page,
             briefing=briefings_by_source.get(page["id"]),
+            harmonized_brief=harmonized_briefings_by_source.get(page["id"]),
             people=existing_people,
             locations=existing_locations,
             claims=existing_claims,
@@ -303,7 +324,94 @@ def run_brief_update(
         "audit_records": audit_records,
         "cost_usd": round(total_cost, 8),
         "usage": total_usage,
+        "harmonization": harmonization_result,
     }
+
+
+def run_brief_harmonization_update(
+    storage: JsonStorage,
+    run_id: str,
+    corpus: str,
+    briefing_model: str = "gpt-5-mini",
+    page_filter: list[str] | None = None,
+) -> dict[str, Any]:
+    pages = load_pages(storage, run_id)
+    if page_filter:
+        before = len(pages)
+        pages = [page for page in pages if any(token in page["id"] for token in page_filter)]
+        print(f"Filtered pages by {page_filter}: {before} -> {len(pages)} page(s)")
+        if not pages:
+            raise RuntimeError(f"--pages filter {page_filter} matched 0 pages")
+
+    existing_people = read_dataset_if_available(storage, "enriched/haymarket/people/latest.json")
+    existing_locations = read_dataset_if_available(storage, "enriched/haymarket/locations/latest.json")
+    existing_claims = read_dataset_if_available(storage, "enriched/haymarket/claims/latest.json")
+    existing_events = read_dataset_if_available(storage, "enriched/haymarket/events/latest.json")
+    briefings_by_source = load_successful_briefings_from_audits(storage, run_id, briefing_model, pages)
+    harmonization_result = run_brief_harmonization(
+        storage=storage,
+        pages=pages,
+        briefings_by_source=briefings_by_source,
+        run_id=run_id,
+        people=existing_people,
+        locations=existing_locations,
+        events=existing_events,
+    )
+    harmonized_briefings_by_source = harmonization_result["briefings_by_source"]
+    bundles = [
+        brief_navigation_bundle(
+            page=page,
+            briefing=briefings_by_source.get(page["id"]),
+            harmonized_brief=harmonized_briefings_by_source.get(page["id"]),
+            people=existing_people,
+            locations=existing_locations,
+            claims=existing_claims,
+            events=existing_events,
+        )
+        for page in pages
+    ]
+    sources = source_summaries(pages, bundles)
+    storage.write_json("enriched/haymarket/sources/latest.json", sources)
+
+    manifest = read_json_if_available(storage, "enriched/haymarket/manifest/latest.json") or {}
+    manifest.update(
+        {
+            "run_id": manifest.get("run_id") or run_id,
+            "corpus": manifest.get("corpus") or corpus,
+            "sources_brief_harmonized_at": datetime.now(timezone.utc).isoformat(),
+            "sources_brief_harmonization_run_id": run_id,
+            "sources_brief_model": briefing_model,
+        }
+    )
+    counts = dict(manifest.get("counts") or {})
+    counts["sources"] = len(sources)
+    manifest["counts"] = counts
+    storage.write_json("enriched/haymarket/manifest/latest.json", manifest)
+
+    return {
+        "sources": sources,
+        "briefings": len(briefings_by_source),
+        "pages": len([page for page in pages if page.get("source_type") != "toc"]),
+        "skipped": len([page for page in pages if page.get("source_type") == "toc"]),
+        "harmonization": harmonization_result,
+    }
+
+
+def load_successful_briefings_from_audits(
+    storage: JsonStorage,
+    run_id: str,
+    model: str,
+    pages: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    briefings: dict[str, dict[str, Any]] = {}
+    for page in pages:
+        if page.get("source_type") == "toc":
+            continue
+        audit = read_successful_brief_audit(storage, run_id, model, page["id"])
+        if not audit:
+            continue
+        briefings[page["id"]] = audit.get("parsed_output") or {}
+    return briefings
 
 
 def read_successful_brief_audit(
@@ -396,6 +504,7 @@ def brief_navigation_bundle(
     locations: list[dict[str, Any]],
     claims: list[dict[str, Any]],
     events: list[dict[str, Any]],
+    harmonized_brief: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     source_id = page["id"]
     source_claims = [claim for claim in claims if claim.get("source_id") == source_id]
@@ -403,6 +512,7 @@ def brief_navigation_bundle(
     return {
         "source_id": source_id,
         "briefing": briefing,
+        "harmonized_brief": harmonized_brief,
         "people": [person for person in people if source_id in person.get("source_ids", [])],
         "all_people": people,
         "locations": [location for location in locations if source_id in location.get("source_ids", [])],
@@ -634,7 +744,8 @@ def source_summaries(pages: list[dict[str, Any]], bundles: list[dict[str, Any]] 
 
 
 def build_source_navigation(page: dict[str, Any], bundle: dict[str, Any] | None = None) -> dict[str, Any]:
-    briefing = (bundle or {}).get("briefing") or {}
+    raw_briefing = (bundle or {}).get("briefing") or {}
+    briefing = (bundle or {}).get("harmonized_brief") or raw_briefing
     metadata = page.get("transcript_metadata", {}) or {}
     people = (bundle or {}).get("people", [])
     locations = (bundle or {}).get("locations", [])
@@ -718,6 +829,11 @@ def build_source_navigation(page: dict[str, Any], bundle: dict[str, Any] | None 
         "event_reference_count": len(referenced_events),
         "document_event_count": len(document_events),
         "confidence": average_confidence([*primary_people, *primary_locations, *referenced_events, *document_events]),
+        "harmonized": bool(
+            (bundle or {}).get("harmonized_brief")
+            or (isinstance(briefing, dict) and briefing.get("harmonization"))
+        ),
+        "harmonization": briefing.get("harmonization") if isinstance(briefing, dict) else None,
     }
 
 
@@ -796,6 +912,9 @@ def normalize_event_refs(
             item = event_to_navigation_ref(event, people, locations)
             item["supporting_quote"] = ref.get("supporting_quote")
             item["page_refs"] = normalize_page_refs(ref.get("page_refs") or item["page_refs"])
+            item["navigation_event_id"] = ref.get("navigation_event_id")
+            item["event_class"] = ref.get("event_class")
+            item["source_event_ref_id"] = ref.get("source_event_ref_id")
             normalized.append(item)
             continue
         location = find_entity(ref.get("location_id"), ref.get("location_label"), locations, id_key="id", label_keys=("name", "address_1886", "address_1887", "modern_address"))
@@ -804,6 +923,9 @@ def normalize_event_refs(
             {
                 "label": ref.get("label"),
                 "canonical_id": ref.get("canonical_id"),
+                "navigation_event_id": ref.get("navigation_event_id"),
+                "event_class": ref.get("event_class"),
+                "source_event_ref_id": ref.get("source_event_ref_id"),
                 "event_time": event_time_to_ref(ref.get("event_time") or {}),
                 "location_label": entity_label(location, ("name",)) if location else ref.get("location_label"),
                 "location_id": location.get("id") if location else ref.get("location_id"),
@@ -873,6 +995,9 @@ def normalize_document_event_refs(
             {
                 "label": ref.get("label"),
                 "event_kind": ref.get("event_kind") or infer_document_event_kind(ref),
+                "navigation_document_event_id": ref.get("navigation_document_event_id"),
+                "event_class": ref.get("event_class"),
+                "source_event_ref_id": ref.get("source_event_ref_id"),
                 "event_time": event_time_to_ref(ref.get("event_time") or {}),
                 "location_label": entity_label(location, ("name",)) if location else ref.get("location_label"),
                 "location_id": location.get("id") if location else ref.get("location_id"),

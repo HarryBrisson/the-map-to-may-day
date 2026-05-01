@@ -26,6 +26,7 @@ BRIEFING_MAX_OUTPUT_TOKENS = 8_000
 # infer roles — a reasoning-friendly task. "low" effort preserves output
 # budget while still giving the model a few hundred tokens to think.
 BRIEFING_REASONING_EFFORT = "low"
+DEFAULT_BRIEFING_ATTEMPTS = 3
 
 
 def run_briefing(
@@ -34,39 +35,81 @@ def run_briefing(
     run_id: str,
     model: str = "gpt-5-mini",
     progress: StageProgress | None = None,
+    max_attempts: int = DEFAULT_BRIEFING_ATTEMPTS,
 ) -> dict[str, Any]:
     progress = progress or StageProgress(page["id"], "briefing", enabled=False)
     progress.info(f"starting ({model})")
-    start = time.monotonic()
+    total_start = time.monotonic()
 
     schema = load_briefing_schema()
     messages = build_briefing_messages(page)
+    max_attempts = max(1, int(max_attempts or 1))
 
-    try:
-        parsed, raw_output, usage = call_openai_structured(
-            model=model,
-            input_messages=messages,
-            schema=schema,
-            schema_name="haymarket_page_briefing",
-            max_output_tokens=BRIEFING_MAX_OUTPUT_TOKENS,
-            reasoning_effort=BRIEFING_REASONING_EFFORT,
+    parsed = None
+    raw_output = None
+    status = "error"
+    error = None
+    usage = zero_usage()
+    attempt_history: list[dict[str, Any]] = []
+    total_usage = zero_usage()
+    total_cost_usd = 0.0
+
+    for attempt in range(1, max_attempts + 1):
+        attempt_start = time.monotonic()
+        attempt_usage = zero_usage()
+        attempt_raw_output = None
+        attempt_status = "error"
+        attempt_error = None
+        try:
+            parsed, attempt_raw_output, attempt_usage = call_openai_structured(
+                model=model,
+                input_messages=messages,
+                schema=schema,
+                schema_name="haymarket_page_briefing",
+                max_output_tokens=BRIEFING_MAX_OUTPUT_TOKENS,
+                reasoning_effort=BRIEFING_REASONING_EFFORT,
+            )
+            # Force speaker_directory IDs into canonical person_<slug> form so
+            # downstream stages (TEI <sp who>, person.id in tagging) share one
+            # vocabulary. The model's exact id choice doesn't matter — we
+            # rewrite from display_name.
+            normalize_speaker_directory(parsed)
+            attempt_status = "success"
+        except Exception as exc:
+            parsed = None
+            attempt_raw_output = exc.raw_output if isinstance(exc, LLMCallError) else None
+            attempt_usage = normalize_usage(
+                exc.usage if isinstance(exc, LLMCallError) else None
+            )
+            attempt_error = str(exc)
+
+        attempt_cost = estimate_cost_usd(model, attempt_usage)
+        total_cost_usd += attempt_cost
+        for key in total_usage:
+            total_usage[key] += attempt_usage.get(key, 0)
+
+        attempt_duration = time.monotonic() - attempt_start
+        attempt_history.append(
+            {
+                "attempt": attempt,
+                "status": attempt_status,
+                "error": attempt_error,
+                "usage": attempt_usage,
+                "cost_usd": round(attempt_cost, 8),
+                "duration_s": round(attempt_duration, 3),
+                "incomplete_reason": extract_incomplete_reason(attempt_raw_output),
+            }
         )
-        # Force speaker_directory IDs into canonical person_<slug> form so
-        # downstream stages (TEI <sp who>, person.id in tagging) share one
-        # vocabulary. The model's exact id choice doesn't matter — we
-        # rewrite from display_name.
-        normalize_speaker_directory(parsed)
-        status = "success"
-        error = None
-    except Exception as exc:
-        parsed = None
-        raw_output = exc.raw_output if isinstance(exc, LLMCallError) else None
-        usage = exc.usage if isinstance(exc, LLMCallError) else {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-        status = "error"
-        error = str(exc)
+        raw_output = attempt_raw_output
+        usage = total_usage
+        status = attempt_status
+        error = attempt_error
+        if attempt_status == "success":
+            break
+        if attempt < max_attempts:
+            progress.info(f"attempt {attempt}/{max_attempts} failed: {attempt_error}; retrying")
 
-    cost_usd = estimate_cost_usd(model, usage)
-    duration = time.monotonic() - start
+    duration = time.monotonic() - total_start
 
     audit = {
         "run_id": run_id,
@@ -79,11 +122,14 @@ def run_briefing(
         "input_messages": messages,
         "raw_output": raw_output,
         "parsed_output": parsed,
-        "usage": usage,
-        "cost_usd": round(cost_usd, 8),
+        "usage": total_usage,
+        "cost_usd": round(total_cost_usd, 8),
         "status": status,
         "error": error,
         "duration_s": round(duration, 3),
+        "attempts": len(attempt_history),
+        "max_attempts": max_attempts,
+        "attempt_history": attempt_history,
     }
 
     audit_path = f"raw/haymarket/llm/{run_id}/{slugify(model)}/{page['id']}/briefing.json"
@@ -91,7 +137,7 @@ def run_briefing(
 
     if status == "success":
         progress.done(
-            f"{briefing_log_label(page, parsed)}, ${cost_usd:.4f}",
+            f"{briefing_log_label(page, parsed)}, ${total_cost_usd:.4f}",
             duration_s=duration,
         )
     else:
@@ -100,8 +146,8 @@ def run_briefing(
     return {
         "briefing": parsed,
         "audit": audit,
-        "usage": usage,
-        "cost_usd": round(cost_usd, 8),
+        "usage": total_usage,
+        "cost_usd": round(total_cost_usd, 8),
         "status": status,
         "error": error,
         "audit_path": audit_path,
@@ -191,6 +237,39 @@ def compact_log_text(value: str, max_length: int = 72) -> str:
     if len(text) <= max_length:
         return text
     return text[: max_length - 1].rstrip() + "…"
+
+
+def zero_usage() -> dict[str, int]:
+    return {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cached_input_tokens": 0,
+    }
+
+
+def normalize_usage(usage: dict[str, Any] | None) -> dict[str, int]:
+    normalized = zero_usage()
+    for key in normalized:
+        normalized[key] = int((usage or {}).get(key) or 0)
+    return normalized
+
+
+def extract_incomplete_reason(raw_output: Any) -> str | None:
+    if not isinstance(raw_output, dict):
+        return None
+    for output in raw_output.get("output") or []:
+        if not isinstance(output, dict):
+            continue
+        incomplete = output.get("incomplete_details") or {}
+        reason = incomplete.get("reason")
+        if reason:
+            return str(reason)
+        status = output.get("status")
+        if status == "incomplete":
+            return "incomplete"
+    return None
 
 
 def normalize_speaker_directory(briefing: dict[str, Any] | None) -> None:

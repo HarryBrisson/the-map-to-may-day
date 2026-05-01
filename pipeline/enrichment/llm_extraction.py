@@ -3,8 +3,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from enrichment.brief_harmonization import HARMONIZATION_VERSION, run_brief_harmonization
 from enrichment.progress import StageProgress
-from enrichment.stage_briefing import BRIEFING_PROMPT_TEMPLATE, run_briefing
+from enrichment.stage_briefing import BRIEFING_PROMPT_TEMPLATE, DEFAULT_BRIEFING_ATTEMPTS, run_briefing
 from enrichment.stage_tagging import DEFAULT_MAX_WORKERS, TAGGING_PROMPT_TEMPLATE, run_tagging
 from enrichment.stage_transcription import (
     TRANSCRIPTION_JSONL_PROMPT_TEMPLATE,
@@ -34,6 +35,7 @@ def extract_pages_with_audit(
     max_tagging_workers: int = DEFAULT_MAX_WORKERS,
     max_tagging_unit_attempts: int = 3,
     streaming: bool = True,
+    max_briefing_attempts: int = DEFAULT_BRIEFING_ATTEMPTS,
     max_transcription_attempts: int = 2,
     transcription_format: str = "tei",
     use_cache: bool = True,
@@ -66,7 +68,7 @@ def extract_pages_with_audit(
                 transcription_model=model,
                 transcription_format=transcription_format,
                 tagging_model=tagging_model or model,
-                briefing_prompt_template=BRIEFING_PROMPT_TEMPLATE,
+                briefing_prompt_template=f"{BRIEFING_PROMPT_TEMPLATE}+{HARMONIZATION_VERSION}",
                 transcription_prompt_template=(
                     TRANSCRIPTION_JSONL_PROMPT_TEMPLATE
                     if transcription_format == "jsonl"
@@ -100,10 +102,27 @@ def extract_pages_with_audit(
             run_id=run_id,
             model=briefing_model,
             progress=progress,
+            max_attempts=max_briefing_attempts,
         )
         briefing_results[page["id"]] = result
         if result["status"] == "success":
             briefings[page["id"]] = result["briefing"] or {}
+
+    if briefings:
+        harmonization = run_brief_harmonization(
+            storage=storage,
+            pages=pages_needing_briefing,
+            briefings_by_source=briefings,
+            run_id=run_id,
+            people=[],
+            locations=[],
+            events=[],
+        )
+        briefings = harmonization["briefings_by_source"]
+        for page_id, result in briefing_results.items():
+            if result.get("status") == "success" and page_id in briefings:
+                result["raw_briefing"] = result.get("briefing")
+                result["briefing"] = briefings[page_id]
 
     for model in models:
         for page in extraction_pages:
@@ -183,6 +202,7 @@ def extract_pages_with_audit(
                     run_id=run_id,
                     config={
                         "briefing_model": briefing_model,
+                        "brief_harmonization_version": HARMONIZATION_VERSION,
                         "transcription_model": model,
                         "transcription_format": transcription_format,
                         "tagging_model": tagging_model or model,

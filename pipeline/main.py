@@ -16,7 +16,7 @@ REPO_ROOT = PIPELINE_ROOT.parent
 sys.path.insert(0, str(PIPELINE_ROOT))
 
 from enrichment.geolocate_locations import run_geolocation  # noqa: E402
-from enrichment.pipeline import run_brief_update, run_enrichment  # noqa: E402
+from enrichment.pipeline import run_brief_harmonization_update, run_brief_update, run_enrichment  # noqa: E402
 from sources.hadc_source import pull_corpus  # noqa: E402
 from utils.s3_storage import make_storage  # noqa: E402
 
@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--user", default="local@example.com", help="User email for future S3 path compatibility")
     parser.add_argument(
         "--action",
-        choices=["pull", "briefs", "enrich", "geocode", "all", "cache-status"],
+        choices=["pull", "briefs", "harmonize-briefs", "enrich", "geocode", "all", "cache-status"],
         default="all",
     )
     parser.add_argument("--corpus", choices=["test", "full"], default="test")
@@ -114,6 +114,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=8,
         help="Concurrent OpenAI calls during Stage C per-unit tagging.",
+    )
+    parser.add_argument(
+        "--briefing-attempts",
+        type=int,
+        default=3,
+        help=(
+            "Max attempts for Stage A briefing per source. The first attempt counts; "
+            "additional attempts only fire when the prior attempt errors. Default 3."
+        ),
     )
     parser.add_argument(
         "--max-brief-workers",
@@ -193,6 +202,14 @@ def parse_args() -> argparse.Namespace:
         help=(
             "For --action briefs, ignore same-run resume files and the durable brief cache, "
             "call the model again, and do not overwrite matching cached briefs."
+        ),
+    )
+    parser.add_argument(
+        "--no-brief-harmonization",
+        action="store_true",
+        help=(
+            "For --action briefs, write raw source navigation directly from briefs and skip the "
+            "Stage A.5 harmonized brief artifact."
         ),
     )
     parser.add_argument(
@@ -340,9 +357,13 @@ def main() -> None:
                 page_filter=args.pages,
                 resume=(not args.no_resume_briefs and not args.fresh_briefs),
                 max_brief_workers=args.max_brief_workers,
+                max_briefing_attempts=args.briefing_attempts,
                 use_brief_cache=(not args.no_cache and not args.fresh_briefs),
                 write_brief_cache=(not args.no_cache and not args.fresh_briefs),
+                harmonize_briefs=not args.no_brief_harmonization,
             )
+            harmonization = result.get("harmonization") or {}
+            coverage = harmonization.get("coverage") or {}
             print(
                 "Updated source briefs: "
                 f"{result['briefings']} of {result['pages']} page(s) briefed, "
@@ -351,7 +372,37 @@ def main() -> None:
                 f"{result['skipped']} skipped, "
                 f"{len(result['sources'])} source navigation records written"
             )
+            if harmonization:
+                print(
+                    "Brief harmonization: "
+                    f"{coverage.get('harmonized_sources', 0)} source(s), "
+                    f"{coverage.get('event_clusters', 0)} event cluster(s), "
+                    f"{coverage.get('document_event_clusters', 0)} document-event cluster(s), "
+                    f"coverage_ok={coverage.get('coverage_ok')}"
+                )
             print(f"LLM cost for brief update: ${result['cost_usd']:.6f}")
+
+        if args.action == "harmonize-briefs":
+            result = run_brief_harmonization_update(
+                storage=storage,
+                run_id=run_id,
+                corpus=args.corpus,
+                briefing_model=args.briefing_model,
+                page_filter=args.pages,
+            )
+            coverage = (result.get("harmonization") or {}).get("coverage") or {}
+            print(
+                "Harmonized source briefs: "
+                f"{result['briefings']} of {result['pages']} page(s), "
+                f"{result['skipped']} skipped, "
+                f"{len(result['sources'])} source navigation records written"
+            )
+            print(
+                "Brief harmonization: "
+                f"{coverage.get('event_clusters', 0)} event cluster(s), "
+                f"{coverage.get('document_event_clusters', 0)} document-event cluster(s), "
+                f"coverage_ok={coverage.get('coverage_ok')}"
+            )
 
         if args.action in {"enrich", "all"}:
             result = run_enrichment(
@@ -366,6 +417,7 @@ def main() -> None:
                 max_tagging_unit_attempts=args.tagging_attempts,
                 streaming=not args.no_streaming,
                 page_filter=args.pages,
+                max_briefing_attempts=args.briefing_attempts,
                 max_transcription_attempts=args.transcription_attempts,
                 transcription_format=args.transcription_format,
                 use_cache=not args.no_cache,

@@ -10,6 +10,7 @@ for module_name in list(sys.modules):
         sys.modules.pop(module_name)
 
 from enrichment import geolocate_locations  # noqa: E402
+from enrichment.brief_harmonization import harmonize_briefings  # noqa: E402
 from enrichment import stage_briefing  # noqa: E402
 from enrichment import stage_tagging  # noqa: E402
 from enrichment import stage_transcription  # noqa: E402
@@ -29,6 +30,7 @@ from sources.hadc_source import (  # noqa: E402
     transcript_artifact_paths,
 )
 from utils import openai_schema  # noqa: E402
+from utils.openai_schema import LLMCallError  # noqa: E402
 from utils.s3_storage import LocalJsonStorage  # noqa: E402
 from bs4 import BeautifulSoup  # noqa: E402
 
@@ -70,6 +72,100 @@ def test_briefing_log_label_matches_document_role() -> None:
     assert stage_briefing.briefing_log_label({"source_type": "testimony"}, testimony) == "witness=John Bonfield"
     assert stage_briefing.briefing_log_label({"source_type": "exhibit"}, exhibit).startswith("exhibit=People's Exhibit 13")
     assert stage_briefing.briefing_log_label({"source_type": "document"}, procedural) == "procedural=Petition for change of venue"
+
+
+def test_run_briefing_retries_parse_failure_then_succeeds(tmp_path, monkeypatch) -> None:
+    storage = LocalJsonStorage(tmp_path)
+    page = {
+        "id": "source_hadc_x1190",
+        "url": "https://example.test/x1190.htm",
+        "title": "People's Exhibit 119",
+        "source_type": "exhibit",
+        "text": "Short exhibit text.",
+        "transcript_metadata": {},
+    }
+    briefing = {
+        "source_id": page["id"],
+        "summary": "Exhibit summary.",
+        "brief_title": "People's Exhibit 119",
+        "navigation_summary": "A newspaper exhibit.",
+        "document_date": {"original_text": "1885 Apr. 25", "normalized_date": "1885-04-25", "precision": "day"},
+        "document_order": {"volume": None, "page_start": None, "page_end": None, "sequence_label": None},
+        "document_role": "exhibit",
+        "witness": {"name": None, "role": None},
+        "examiners": [],
+        "defendants_referenced": [],
+        "key_locations": [],
+        "key_dates": [],
+        "topics": [],
+        "primary_people": [],
+        "primary_locations": [],
+        "referenced_events": [],
+        "document_events": [],
+        "speaker_directory": [],
+    }
+    calls = {"count": 0}
+
+    def structured_response(*args, **kwargs):
+        del args, kwargs
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise LLMCallError(
+                "OpenAI returned output that could not be parsed as JSON",
+                raw_output={"output": [{"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}}]},
+                usage={"input_tokens": 10, "output_tokens": 8000, "total_tokens": 8010},
+            )
+        return briefing, {"output": "structured"}, {"input_tokens": 11, "output_tokens": 9, "total_tokens": 20}
+
+    monkeypatch.setattr(stage_briefing, "call_openai_structured", structured_response)
+    result = stage_briefing.run_briefing(
+        page=page,
+        storage=storage,
+        run_id="retry_run",
+        model="gpt-5-mini",
+        max_attempts=3,
+    )
+
+    assert result["status"] == "success"
+    assert calls["count"] == 2
+    assert result["usage"]["input_tokens"] == 21
+    assert result["audit"]["attempts"] == 2
+    assert result["audit"]["attempt_history"][0]["incomplete_reason"] == "max_output_tokens"
+    assert storage.exists("raw/haymarket/llm/retry_run/gpt_5_mini/source_hadc_x1190/briefing.json")
+
+
+def test_run_briefing_records_all_failed_attempts(tmp_path, monkeypatch) -> None:
+    storage = LocalJsonStorage(tmp_path)
+    page = {
+        "id": "source_hadc_fail",
+        "url": "https://example.test/fail.htm",
+        "title": "Failing exhibit",
+        "source_type": "exhibit",
+        "text": "Short exhibit text.",
+        "transcript_metadata": {},
+    }
+
+    def structured_response(*args, **kwargs):
+        del args, kwargs
+        raise LLMCallError(
+            "OpenAI returned output that could not be parsed as JSON",
+            raw_output={"output": [{"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}}]},
+            usage={"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+        )
+
+    monkeypatch.setattr(stage_briefing, "call_openai_structured", structured_response)
+    result = stage_briefing.run_briefing(
+        page=page,
+        storage=storage,
+        run_id="failed_retry_run",
+        model="gpt-5-mini",
+        max_attempts=2,
+    )
+
+    assert result["status"] == "error"
+    assert result["usage"]["total_tokens"] == 10
+    assert result["audit"]["attempts"] == 2
+    assert [item["status"] for item in result["audit"]["attempt_history"]] == ["error", "error"]
 
 
 def test_page_cache_hit_skips_all_three_stages(tmp_path, monkeypatch) -> None:
@@ -729,6 +825,143 @@ def test_run_brief_update_writes_source_navigation_without_transcription(tmp_pat
     assert source["navigation"]["brief_title"] == "Bonfield testimony"
     assert source["navigation"]["document_date"]["normalized_date"] == "1886-07-16"
     assert source["navigation"]["primary_people"][0]["canonical_id"] == "person_john_bonfield"
+    assert source["navigation"]["harmonized"] is True
+    assert storage.exists("enriched/haymarket/brief_harmonization/latest.json")
+
+
+def test_brief_harmonization_separates_historical_document_and_routine_events() -> None:
+    source_id = "source_hadc_x0010"
+    page = {
+        "id": source_id,
+        "title": "People's Exhibit 1",
+        "source_type": "exhibit",
+        "transcript_metadata": {},
+    }
+    briefing = {
+        "source_id": source_id,
+        "summary": "Map exhibit.",
+        "brief_title": "People's Ex. 1",
+        "navigation_summary": "A map used in the trial.",
+        "document_role": "exhibit",
+        "topics": ["bombs", "newspaper"],
+        "primary_people": [{"label": "John Bonfield", "canonical_id": None, "role_or_relationship": "mentioned", "confidence": 0.8}],
+        "primary_locations": [],
+        "speaker_directory": [],
+        "referenced_events": [
+            {
+                "label": "Haymarket meeting and bombing",
+                "canonical_id": None,
+                "event_time": {"start": "1886-05-04", "end": None, "precision": "day", "original_text": "May 4, 1886"},
+                "location_label": "Haymarket Square",
+                "location_id": None,
+                "participant_labels": ["John Bonfield"],
+                "participant_person_ids": [],
+                "summary": "The Haymarket meeting ended with a bomb.",
+                "supporting_quote": "Haymarket meeting",
+                "page_refs": ["p. 1"],
+                "confidence": 0.9,
+            },
+            {
+                "label": "Exhibit introduced into evidence",
+                "canonical_id": None,
+                "event_time": {"start": "1886-07-16", "end": None, "precision": "day", "original_text": "July 16"},
+                "location_label": None,
+                "location_id": None,
+                "participant_labels": [],
+                "participant_person_ids": [],
+                "summary": "The map was introduced into evidence.",
+                "supporting_quote": None,
+                "page_refs": [],
+                "confidence": 0.7,
+            },
+        ],
+        "document_events": [
+            {
+                "label": "Court recess",
+                "event_kind": "court_procedure",
+                "event_time": {"start": "1886-07-16", "end": None, "precision": "day", "original_text": "July 16"},
+                "location_label": None,
+                "location_id": None,
+                "participant_labels": [],
+                "participant_person_ids": [],
+                "summary": "A recess was taken.",
+                "supporting_quote": None,
+                "page_refs": [],
+                "confidence": 0.6,
+            }
+        ],
+    }
+    people = [{"id": "person_john_bonfield", "display_name": "John Bonfield", "alternate_names": []}]
+
+    result = harmonize_briefings(
+        pages=[page],
+        briefings_by_source={source_id: briefing},
+        run_id="harmonize_test",
+        people=people,
+        locations=[],
+        events=[],
+    )
+    harmonized = result["briefings_by_source"][source_id]
+
+    assert harmonized["primary_people"][0]["canonical_id"] == "person_john_bonfield"
+    assert harmonized["topics"] == ["explosives", "press and publications"]
+    assert len(harmonized["referenced_events"]) == 1
+    assert harmonized["referenced_events"][0]["event_class"] == "historical_event"
+    assert len(harmonized["document_events"]) == 1
+    assert harmonized["document_events"][0]["event_kind"] == "evidence_introduction"
+    assert len(harmonized["routine_procedural_events"]) == 1
+    assert result["coverage"]["coverage_ok"] is True
+
+
+def test_brief_harmonization_clusters_near_duplicate_events() -> None:
+    pages = [
+        {"id": "s1", "title": "S1", "source_type": "testimony", "transcript_metadata": {}},
+        {"id": "s2", "title": "S2", "source_type": "testimony", "transcript_metadata": {}},
+    ]
+
+    def brief(label):
+        return {
+            "source_id": "",
+            "summary": "",
+            "brief_title": label,
+            "navigation_summary": "",
+            "document_role": "testimony",
+            "topics": [],
+            "primary_people": [],
+            "primary_locations": [],
+            "speaker_directory": [],
+            "referenced_events": [
+                {
+                    "label": label,
+                    "canonical_id": None,
+                    "event_time": {"start": "1886-05-04", "end": None, "precision": "day", "original_text": "May 4"},
+                    "location_label": "Haymarket Square",
+                    "location_id": None,
+                    "participant_labels": [],
+                    "participant_person_ids": [],
+                    "summary": label,
+                    "supporting_quote": None,
+                    "page_refs": [],
+                    "confidence": 0.8,
+                }
+            ],
+            "document_events": [],
+        }
+
+    result = harmonize_briefings(
+        pages=pages,
+        briefings_by_source={
+            "s1": brief("Haymarket meeting and bombing"),
+            "s2": brief("Haymarket bomb explosion"),
+        },
+        run_id="cluster_test",
+        people=[],
+        locations=[],
+        events=[],
+    )
+
+    assert len(result["event_clusters"]) == 1
+    assert result["event_clusters"][0]["support_count"] == 2
 
 
 def test_run_brief_update_uses_durable_brief_cache_across_run_ids(tmp_path, monkeypatch) -> None:
