@@ -16,6 +16,12 @@ REPO_ROOT = PIPELINE_ROOT.parent
 sys.path.insert(0, str(PIPELINE_ROOT))
 
 from enrichment.geolocate_locations import run_geolocation  # noqa: E402
+from enrichment.brief_harmonization import (  # noqa: E402
+    DEFAULT_EMBEDDING_DIMENSIONS,
+    DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_ESCALATION_REVIEW_MODEL,
+    DEFAULT_REVIEW_MODEL,
+)
 from enrichment.pipeline import run_brief_harmonization_update, run_brief_update, run_enrichment  # noqa: E402
 from sources.hadc_source import pull_corpus  # noqa: E402
 from utils.s3_storage import make_storage  # noqa: E402
@@ -213,6 +219,43 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--brief-harmonization-embedding-model",
+        default=DEFAULT_EMBEDDING_MODEL,
+        help=(
+            "Embedding model for Stage A.5 harmonization. Default text-embedding-3-large. "
+            "Use text-embedding-3-small for budget exploratory runs."
+        ),
+    )
+    parser.add_argument(
+        "--brief-harmonization-embedding-dimensions",
+        type=int,
+        default=DEFAULT_EMBEDDING_DIMENSIONS,
+        help=(
+            "Embedding dimensions for Stage A.5 harmonization. Default 1024 for "
+            "text-embedding-3-large; use 512 with text-embedding-3-small for budget mode."
+        ),
+    )
+    parser.add_argument(
+        "--no-brief-harmonization-embeddings",
+        action="store_true",
+        help="Skip semantic embedding generation during Stage A.5 harmonization.",
+    )
+    parser.add_argument(
+        "--brief-harmonization-review-model",
+        default=DEFAULT_REVIEW_MODEL,
+        help="Structured-output model for ambiguous Stage A.5 merge/classification review.",
+    )
+    parser.add_argument(
+        "--brief-harmonization-escalation-model",
+        default=DEFAULT_ESCALATION_REVIEW_MODEL,
+        help="Structured-output model for high-risk Stage A.5 review batches.",
+    )
+    parser.add_argument(
+        "--no-brief-harmonization-llm-review",
+        action="store_true",
+        help="Skip LLM confirmation for ambiguous Stage A.5 candidate matches.",
+    )
+    parser.add_argument(
         "--clear-cache",
         action="store_true",
         help="Wipe durable Haymarket bundle and brief caches before running (separate from --clear-data).",
@@ -293,6 +336,11 @@ def main() -> None:
     args = parse_args()
     if args.test:
         args.corpus = "test"
+    if (
+        args.brief_harmonization_embedding_model == "text-embedding-3-small"
+        and args.brief_harmonization_embedding_dimensions == DEFAULT_EMBEDDING_DIMENSIONS
+    ):
+        args.brief_harmonization_embedding_dimensions = 512
     if args.slate:
         slate_models = MODEL_SLATES[args.slate]
         if args.llm_model:
@@ -361,6 +409,12 @@ def main() -> None:
                 use_brief_cache=(not args.no_cache and not args.fresh_briefs),
                 write_brief_cache=(not args.no_cache and not args.fresh_briefs),
                 harmonize_briefs=not args.no_brief_harmonization,
+                brief_harmonization_use_embeddings=not args.no_brief_harmonization_embeddings,
+                brief_harmonization_embedding_model=args.brief_harmonization_embedding_model,
+                brief_harmonization_embedding_dimensions=args.brief_harmonization_embedding_dimensions,
+                brief_harmonization_use_llm_review=not args.no_brief_harmonization_llm_review,
+                brief_harmonization_review_model=args.brief_harmonization_review_model,
+                brief_harmonization_escalation_model=args.brief_harmonization_escalation_model,
             )
             harmonization = result.get("harmonization") or {}
             coverage = harmonization.get("coverage") or {}
@@ -373,6 +427,10 @@ def main() -> None:
                 f"{len(result['sources'])} source navigation records written"
             )
             if harmonization:
+                harmonization_cost = (
+                    float((harmonization.get("embedding_cache_manifest") or {}).get("cost_usd") or 0.0)
+                    + float(((harmonization.get("qa_report") or {}).get("llm_review") or {}).get("cost_usd") or 0.0)
+                )
                 print(
                     "Brief harmonization: "
                     f"{coverage.get('harmonized_sources', 0)} source(s), "
@@ -380,6 +438,7 @@ def main() -> None:
                     f"{coverage.get('document_event_clusters', 0)} document-event cluster(s), "
                     f"coverage_ok={coverage.get('coverage_ok')}"
                 )
+                print(f"Brief harmonization cost: ${harmonization_cost:.6f}")
             print(f"LLM cost for brief update: ${result['cost_usd']:.6f}")
 
         if args.action == "harmonize-briefs":
@@ -389,6 +448,12 @@ def main() -> None:
                 corpus=args.corpus,
                 briefing_model=args.briefing_model,
                 page_filter=args.pages,
+                brief_harmonization_use_embeddings=not args.no_brief_harmonization_embeddings,
+                brief_harmonization_embedding_model=args.brief_harmonization_embedding_model,
+                brief_harmonization_embedding_dimensions=args.brief_harmonization_embedding_dimensions,
+                brief_harmonization_use_llm_review=not args.no_brief_harmonization_llm_review,
+                brief_harmonization_review_model=args.brief_harmonization_review_model,
+                brief_harmonization_escalation_model=args.brief_harmonization_escalation_model,
             )
             coverage = (result.get("harmonization") or {}).get("coverage") or {}
             print(
@@ -403,6 +468,12 @@ def main() -> None:
                 f"{coverage.get('document_event_clusters', 0)} document-event cluster(s), "
                 f"coverage_ok={coverage.get('coverage_ok')}"
             )
+            harmonization = result.get("harmonization") or {}
+            harmonization_cost = (
+                float((harmonization.get("embedding_cache_manifest") or {}).get("cost_usd") or 0.0)
+                + float(((harmonization.get("qa_report") or {}).get("llm_review") or {}).get("cost_usd") or 0.0)
+            )
+            print(f"Brief harmonization cost: ${harmonization_cost:.6f}")
 
         if args.action in {"enrich", "all"}:
             result = run_enrichment(
@@ -421,6 +492,12 @@ def main() -> None:
                 max_transcription_attempts=args.transcription_attempts,
                 transcription_format=args.transcription_format,
                 use_cache=not args.no_cache,
+                brief_harmonization_use_embeddings=not args.no_brief_harmonization_embeddings,
+                brief_harmonization_embedding_model=args.brief_harmonization_embedding_model,
+                brief_harmonization_embedding_dimensions=args.brief_harmonization_embedding_dimensions,
+                brief_harmonization_use_llm_review=not args.no_brief_harmonization_llm_review,
+                brief_harmonization_review_model=args.brief_harmonization_review_model,
+                brief_harmonization_escalation_model=args.brief_harmonization_escalation_model,
             )
             print(
                 "Enriched "

@@ -3,7 +3,14 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from enrichment.brief_harmonization import HARMONIZATION_VERSION, run_brief_harmonization
+from enrichment.brief_harmonization import (
+    DEFAULT_EMBEDDING_DIMENSIONS,
+    DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_ESCALATION_REVIEW_MODEL,
+    DEFAULT_REVIEW_MODEL,
+    HARMONIZATION_VERSION,
+    run_brief_harmonization,
+)
 from enrichment.progress import StageProgress
 from enrichment.stage_briefing import BRIEFING_PROMPT_TEMPLATE, DEFAULT_BRIEFING_ATTEMPTS, run_briefing
 from enrichment.stage_tagging import DEFAULT_MAX_WORKERS, TAGGING_PROMPT_TEMPLATE, run_tagging
@@ -39,6 +46,12 @@ def extract_pages_with_audit(
     max_transcription_attempts: int = 2,
     transcription_format: str = "tei",
     use_cache: bool = True,
+    brief_harmonization_use_embeddings: bool = False,
+    brief_harmonization_embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+    brief_harmonization_embedding_dimensions: int = DEFAULT_EMBEDDING_DIMENSIONS,
+    brief_harmonization_use_llm_review: bool = False,
+    brief_harmonization_review_model: str = DEFAULT_REVIEW_MODEL,
+    brief_harmonization_escalation_model: str = DEFAULT_ESCALATION_REVIEW_MODEL,
 ) -> dict[str, Any]:
     if provider != "openai":
         raise ValueError(f"Unsupported LLM provider: {provider}")
@@ -58,6 +71,15 @@ def extract_pages_with_audit(
     # all three stages entirely. Briefing is keyed only by page+briefing
     # config, not the slate model — so we share one cache check across
     # all model-slate iterations.
+    brief_harmonization_cache_label = (
+        f"{HARMONIZATION_VERSION}|"
+        f"emb={brief_harmonization_use_embeddings}:"
+        f"{brief_harmonization_embedding_model}:"
+        f"{brief_harmonization_embedding_dimensions}|"
+        f"review={brief_harmonization_use_llm_review}:"
+        f"{brief_harmonization_review_model}:"
+        f"{brief_harmonization_escalation_model}"
+    )
     pages_needing_briefing: list[dict[str, Any]] = []
     page_cache_keys: dict[tuple[str, str], str] = {}
     for page in extraction_pages:
@@ -68,7 +90,7 @@ def extract_pages_with_audit(
                 transcription_model=model,
                 transcription_format=transcription_format,
                 tagging_model=tagging_model or model,
-                briefing_prompt_template=f"{BRIEFING_PROMPT_TEMPLATE}+{HARMONIZATION_VERSION}",
+                briefing_prompt_template=f"{BRIEFING_PROMPT_TEMPLATE}+{brief_harmonization_cache_label}",
                 transcription_prompt_template=(
                     TRANSCRIPTION_JSONL_PROMPT_TEMPLATE
                     if transcription_format == "jsonl"
@@ -117,6 +139,12 @@ def extract_pages_with_audit(
             people=[],
             locations=[],
             events=[],
+            use_embeddings=brief_harmonization_use_embeddings,
+            embedding_model=brief_harmonization_embedding_model,
+            embedding_dimensions=brief_harmonization_embedding_dimensions,
+            use_llm_review=brief_harmonization_use_llm_review,
+            review_model=brief_harmonization_review_model,
+            escalation_review_model=brief_harmonization_escalation_model,
         )
         briefings = harmonization["briefings_by_source"]
         for page_id, result in briefing_results.items():
@@ -203,6 +231,12 @@ def extract_pages_with_audit(
                     config={
                         "briefing_model": briefing_model,
                         "brief_harmonization_version": HARMONIZATION_VERSION,
+                        "brief_harmonization_embedding_model": brief_harmonization_embedding_model,
+                        "brief_harmonization_embedding_dimensions": brief_harmonization_embedding_dimensions,
+                        "brief_harmonization_use_embeddings": brief_harmonization_use_embeddings,
+                        "brief_harmonization_review_model": brief_harmonization_review_model,
+                        "brief_harmonization_escalation_model": brief_harmonization_escalation_model,
+                        "brief_harmonization_use_llm_review": brief_harmonization_use_llm_review,
                         "transcription_model": model,
                         "transcription_format": transcription_format,
                         "tagging_model": tagging_model or model,

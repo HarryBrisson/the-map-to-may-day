@@ -7,7 +7,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any
 
-from enrichment.brief_harmonization import run_brief_harmonization
+from enrichment.brief_harmonization import (
+    DEFAULT_EMBEDDING_DIMENSIONS,
+    DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_ESCALATION_REVIEW_MODEL,
+    DEFAULT_REVIEW_MODEL,
+    run_brief_harmonization,
+)
 from enrichment.harmonization import harmonize_bundles
 from enrichment.llm_extraction import extract_pages_with_audit
 from enrichment.schema_validation import validate_items
@@ -35,6 +41,12 @@ def run_enrichment(
     max_transcription_attempts: int = 2,
     transcription_format: str = "tei",
     use_cache: bool = True,
+    brief_harmonization_use_embeddings: bool = False,
+    brief_harmonization_embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+    brief_harmonization_embedding_dimensions: int = DEFAULT_EMBEDDING_DIMENSIONS,
+    brief_harmonization_use_llm_review: bool = False,
+    brief_harmonization_review_model: str = DEFAULT_REVIEW_MODEL,
+    brief_harmonization_escalation_model: str = DEFAULT_ESCALATION_REVIEW_MODEL,
 ) -> dict[str, list[dict[str, Any]]]:
     pages = load_pages(storage, run_id)
     if page_filter:
@@ -58,6 +70,12 @@ def run_enrichment(
         max_transcription_attempts=max_transcription_attempts,
         transcription_format=transcription_format,
         use_cache=use_cache,
+        brief_harmonization_use_embeddings=brief_harmonization_use_embeddings,
+        brief_harmonization_embedding_model=brief_harmonization_embedding_model,
+        brief_harmonization_embedding_dimensions=brief_harmonization_embedding_dimensions,
+        brief_harmonization_use_llm_review=brief_harmonization_use_llm_review,
+        brief_harmonization_review_model=brief_harmonization_review_model,
+        brief_harmonization_escalation_model=brief_harmonization_escalation_model,
     )
     failed_calls = [record for record in extraction["audit_records"] if record["status"] == "error"]
     successful_calls = [
@@ -160,6 +178,12 @@ def run_brief_update(
     use_brief_cache: bool = True,
     write_brief_cache: bool = True,
     harmonize_briefs: bool = True,
+    brief_harmonization_use_embeddings: bool = False,
+    brief_harmonization_embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+    brief_harmonization_embedding_dimensions: int = DEFAULT_EMBEDDING_DIMENSIONS,
+    brief_harmonization_use_llm_review: bool = False,
+    brief_harmonization_review_model: str = DEFAULT_REVIEW_MODEL,
+    brief_harmonization_escalation_model: str = DEFAULT_ESCALATION_REVIEW_MODEL,
 ) -> dict[str, Any]:
     pages = load_pages(storage, run_id)
     if page_filter:
@@ -281,6 +305,12 @@ def run_brief_update(
             people=existing_people,
             locations=existing_locations,
             events=existing_events,
+            use_embeddings=brief_harmonization_use_embeddings,
+            embedding_model=brief_harmonization_embedding_model,
+            embedding_dimensions=brief_harmonization_embedding_dimensions,
+            use_llm_review=brief_harmonization_use_llm_review,
+            review_model=brief_harmonization_review_model,
+            escalation_review_model=brief_harmonization_escalation_model,
         )
         harmonized_briefings_by_source = harmonization_result["briefings_by_source"]
 
@@ -334,6 +364,12 @@ def run_brief_harmonization_update(
     corpus: str,
     briefing_model: str = "gpt-5-mini",
     page_filter: list[str] | None = None,
+    brief_harmonization_use_embeddings: bool = False,
+    brief_harmonization_embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+    brief_harmonization_embedding_dimensions: int = DEFAULT_EMBEDDING_DIMENSIONS,
+    brief_harmonization_use_llm_review: bool = False,
+    brief_harmonization_review_model: str = DEFAULT_REVIEW_MODEL,
+    brief_harmonization_escalation_model: str = DEFAULT_ESCALATION_REVIEW_MODEL,
 ) -> dict[str, Any]:
     pages = load_pages(storage, run_id)
     if page_filter:
@@ -356,6 +392,12 @@ def run_brief_harmonization_update(
         people=existing_people,
         locations=existing_locations,
         events=existing_events,
+        use_embeddings=brief_harmonization_use_embeddings,
+        embedding_model=brief_harmonization_embedding_model,
+        embedding_dimensions=brief_harmonization_embedding_dimensions,
+        use_llm_review=brief_harmonization_use_llm_review,
+        review_model=brief_harmonization_review_model,
+        escalation_review_model=brief_harmonization_escalation_model,
     )
     harmonized_briefings_by_source = harmonization_result["briefings_by_source"]
     bundles = [

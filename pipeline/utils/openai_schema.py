@@ -169,6 +169,37 @@ def call_openai_structured(
     return parsed, raw_output, usage
 
 
+def call_openai_embeddings(
+    model: str,
+    inputs: list[str],
+    dimensions: int | None = None,
+) -> tuple[list[list[float]], Any, dict[str, int]]:
+    from openai import OpenAI
+
+    client = OpenAI()
+    request: dict[str, Any] = {
+        "model": model,
+        "input": inputs,
+        "encoding_format": "float",
+    }
+    if dimensions is not None:
+        request["dimensions"] = dimensions
+
+    response = client.embeddings.create(**request)
+    raw_output = response.model_dump(mode="json")
+    usage_obj = raw_output.get("usage") or {}
+    prompt_tokens = int(usage_obj.get("prompt_tokens") or usage_obj.get("total_tokens") or 0)
+    usage = {
+        "input_tokens": prompt_tokens,
+        "output_tokens": 0,
+        "total_tokens": int(usage_obj.get("total_tokens") or prompt_tokens),
+        "reasoning_tokens": 0,
+        "cached_input_tokens": 0,
+    }
+    vectors = [item["embedding"] for item in sorted(raw_output.get("data") or [], key=lambda item: item.get("index", 0))]
+    return vectors, raw_output, usage
+
+
 def _extract_usage(raw_output: dict[str, Any]) -> dict[str, int]:
     """Pull token counts from a Responses API response.
 
@@ -218,6 +249,9 @@ MODEL_PRICING_PER_1M = {
     "o3-mini": {"input": 1.10, "output": 4.40},
     "o4-mini": {"input": 1.10, "output": 4.40},
     "o3": {"input": 2.00, "output": 8.00},
+    # Embedding models use input token pricing only.
+    "text-embedding-3-small": {"input": 0.02, "output": 0.0},
+    "text-embedding-3-large": {"input": 0.13, "output": 0.0},
 }
 
 

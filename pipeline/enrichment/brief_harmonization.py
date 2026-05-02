@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import math
 import re
 from collections import Counter
@@ -10,10 +11,17 @@ from difflib import SequenceMatcher
 from typing import Any
 
 from utils.ids import slugify
+from utils.openai_schema import call_openai_embeddings, call_openai_structured, estimate_cost_usd
 from utils.s3_storage import JsonStorage
 
 
-HARMONIZATION_VERSION = "brief_harmonization_v1"
+HARMONIZATION_VERSION = "brief_harmonization_v2"
+DEFAULT_EMBEDDING_MODEL = "text-embedding-3-large"
+DEFAULT_EMBEDDING_DIMENSIONS = 1024
+DEFAULT_REVIEW_MODEL = "gpt-5.4-mini"
+DEFAULT_ESCALATION_REVIEW_MODEL = "gpt-5.5"
+DEFAULT_REVIEW_REASONING_EFFORT = "low"
+DEFAULT_ESCALATION_REASONING_EFFORT = "medium"
 HISTORICAL_CLASS = "historical_event"
 DOCUMENT_CLASS = "document_event"
 BOTH_CLASS = "both"
@@ -99,28 +107,58 @@ def run_brief_harmonization(
     people: list[dict[str, Any]] | None = None,
     locations: list[dict[str, Any]] | None = None,
     events: list[dict[str, Any]] | None = None,
+    use_embeddings: bool = False,
+    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+    embedding_dimensions: int = DEFAULT_EMBEDDING_DIMENSIONS,
+    use_llm_review: bool = False,
+    review_model: str = DEFAULT_REVIEW_MODEL,
+    escalation_review_model: str = DEFAULT_ESCALATION_REVIEW_MODEL,
 ) -> dict[str, Any]:
     result = harmonize_briefings(
+        storage=storage,
         pages=pages,
         briefings_by_source=briefings_by_source,
         run_id=run_id,
         people=people or [],
         locations=locations or [],
         events=events or [],
+        use_embeddings=use_embeddings,
+        embedding_model=embedding_model,
+        embedding_dimensions=embedding_dimensions,
+        use_llm_review=use_llm_review,
+        review_model=review_model,
+        escalation_review_model=escalation_review_model,
     )
+    raw_prefix = f"raw/haymarket/brief_harmonization/{run_id}"
     storage.write_json("enriched/haymarket/brief_harmonization/latest.json", result["artifact"])
-    storage.write_json(f"raw/haymarket/brief_harmonization/{run_id}/audit.json", result["artifact"])
+    storage.write_json(f"{raw_prefix}/audit.json", result["artifact"])
+    storage.write_json(f"{raw_prefix}/normalized_refs.json", result["normalized_refs"])
+    storage.write_json(f"{raw_prefix}/embedding_inputs.json", result["embedding_inputs"])
+    storage.write_json(f"{raw_prefix}/embedding_cache_manifest.json", result["embedding_cache_manifest"])
+    storage.write_json(f"{raw_prefix}/candidate_matches.json", result["candidate_matches"])
+    storage.write_json(f"{raw_prefix}/proposed_clusters.json", result["proposed_clusters"])
+    storage.write_json(f"{raw_prefix}/final_clusters.json", result["final_clusters"])
+    storage.write_json(f"{raw_prefix}/qa_report.json", result["qa_report"])
+    for batch in result["llm_review_batches"]:
+        storage.write_json(f"{raw_prefix}/llm_review_batches/{batch['batch_id']}.json", batch)
     return result
 
 
 def harmonize_briefings(
     *,
+    storage: JsonStorage | None = None,
     pages: list[dict[str, Any]],
     briefings_by_source: dict[str, dict[str, Any]],
     run_id: str,
     people: list[dict[str, Any]] | None = None,
     locations: list[dict[str, Any]] | None = None,
     events: list[dict[str, Any]] | None = None,
+    use_embeddings: bool = False,
+    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+    embedding_dimensions: int = DEFAULT_EMBEDDING_DIMENSIONS,
+    use_llm_review: bool = False,
+    review_model: str = DEFAULT_REVIEW_MODEL,
+    escalation_review_model: str = DEFAULT_ESCALATION_REVIEW_MODEL,
 ) -> dict[str, Any]:
     people = people or []
     locations = locations or []
@@ -197,8 +235,74 @@ def harmonize_briefings(
             routine_refs.append({**ref, "source_id": source_id})
             classification_counts[ROUTINE_CLASS] += 1
 
-    event_clusters = cluster_event_refs(event_refs, "brief_event", is_document=False)
-    document_event_clusters = cluster_event_refs(document_event_refs, "brief_document_event", is_document=True)
+    classification_review_batches = review_ambiguous_classifications(
+        event_refs=event_refs,
+        document_event_refs=document_event_refs,
+        routine_refs=routine_refs,
+        enabled=use_llm_review,
+        review_model=review_model,
+    )
+    event_refs, document_event_refs, routine_refs = apply_classification_reviews(
+        harmonized_by_source=harmonized_by_source,
+        event_refs=event_refs,
+        document_event_refs=document_event_refs,
+        routine_refs=routine_refs,
+        review_batches=classification_review_batches,
+    )
+    classification_counts = Counter()
+    for ref in event_refs:
+        classification_counts[ref.get("event_class") or HISTORICAL_CLASS] += 1
+    for ref in document_event_refs:
+        classification_counts[ref.get("event_class") or DOCUMENT_CLASS] += 1
+    for _ref in routine_refs:
+        classification_counts[ROUTINE_CLASS] += 1
+
+    normalized_refs = build_normalized_refs(
+        harmonized_by_source=harmonized_by_source,
+        event_refs=event_refs,
+        document_event_refs=document_event_refs,
+        routine_refs=routine_refs,
+    )
+    embedding_inputs = build_embedding_inputs(
+        normalized_refs=normalized_refs,
+        people=people,
+        locations=locations,
+        events=events,
+        harmonized_by_source=harmonized_by_source,
+    )
+    vectors_by_id, embedding_cache_manifest = load_or_create_embeddings(
+        storage=storage,
+        embedding_inputs=embedding_inputs,
+        model=embedding_model,
+        dimensions=embedding_dimensions,
+        enabled=use_embeddings,
+    )
+    candidate_matches = build_candidate_matches(normalized_refs, vectors_by_id, embedding_inputs)
+    llm_review_batches = classification_review_batches + review_ambiguous_candidates(
+        candidate_matches=candidate_matches,
+        normalized_refs=normalized_refs,
+        enabled=use_llm_review,
+        review_model=review_model,
+        escalation_review_model=escalation_review_model,
+    )
+    approved_pairs = approved_match_pairs(candidate_matches, llm_review_batches)
+
+    event_clusters = cluster_event_refs(event_refs, "brief_event", is_document=False, approved_pairs=approved_pairs)
+    document_event_clusters = cluster_event_refs(
+        document_event_refs,
+        "brief_document_event",
+        is_document=True,
+        approved_pairs=approved_pairs,
+    )
+    proposed_clusters = {
+        "event_clusters": cluster_event_refs(event_refs, "brief_event", is_document=False),
+        "document_event_clusters": cluster_event_refs(document_event_refs, "brief_document_event", is_document=True),
+    }
+    final_clusters = {
+        "event_clusters": event_clusters,
+        "document_event_clusters": document_event_clusters,
+        "routine_procedural_refs": routine_refs,
+    }
     assign_cluster_ids(harmonized_by_source, event_clusters, "referenced_events", "navigation_event_id")
     assign_cluster_ids(harmonized_by_source, document_event_clusters, "document_events", "navigation_document_event_id")
 
@@ -209,6 +313,12 @@ def harmonize_briefings(
         event_clusters=event_clusters,
         document_event_clusters=document_event_clusters,
         routine_refs=routine_refs,
+    )
+    qa_report = build_qa_report(
+        coverage=coverage,
+        candidate_matches=candidate_matches,
+        llm_review_batches=llm_review_batches,
+        final_clusters=final_clusters,
     )
     artifact = {
         "run_id": run_id,
@@ -223,8 +333,21 @@ def harmonize_briefings(
         "methods": {
             "deterministic": True,
             "character_similarity": True,
-            "embedding_cosine": "local_char_ngram_cosine",
-            "llm_confirmation": "deferred_to_review_layer",
+            "embedding_cosine": {
+                "enabled": use_embeddings,
+                "model": embedding_model,
+                "dimensions": embedding_dimensions,
+                "cache_hits": embedding_cache_manifest.get("cache_hits", 0),
+                "created": embedding_cache_manifest.get("created", 0),
+            },
+            "llm_confirmation": {
+                "enabled": use_llm_review,
+                "review_model": review_model,
+                "review_reasoning_effort": DEFAULT_REVIEW_REASONING_EFFORT,
+                "escalation_review_model": escalation_review_model,
+                "escalation_reasoning_effort": DEFAULT_ESCALATION_REASONING_EFFORT,
+                "batches": len(llm_review_batches),
+            },
         },
     }
     return {
@@ -233,6 +356,814 @@ def harmonize_briefings(
         "coverage": coverage,
         "event_clusters": event_clusters,
         "document_event_clusters": document_event_clusters,
+        "normalized_refs": normalized_refs,
+        "embedding_inputs": embedding_inputs,
+        "embedding_cache_manifest": embedding_cache_manifest,
+        "candidate_matches": candidate_matches,
+        "proposed_clusters": proposed_clusters,
+        "llm_review_batches": llm_review_batches,
+        "final_clusters": final_clusters,
+        "qa_report": qa_report,
+    }
+
+
+def build_normalized_refs(
+    *,
+    harmonized_by_source: dict[str, dict[str, Any]],
+    event_refs: list[dict[str, Any]],
+    document_event_refs: list[dict[str, Any]],
+    routine_refs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    for source_id, briefing in harmonized_by_source.items():
+        source_title = clean_text(briefing.get("brief_title")) or source_id
+        for index, person in enumerate(briefing.get("primary_people") or []):
+            refs.append(
+                normalized_ref(
+                    ref_id=f"{source_id}:primary_people:{index}",
+                    source_id=source_id,
+                    ref_type="person",
+                    label=person.get("label"),
+                    canonical_id=person.get("canonical_id"),
+                    description=person.get("role_or_relationship"),
+                    source_title=source_title,
+                    confidence=person.get("confidence"),
+                )
+            )
+        for index, location in enumerate(briefing.get("primary_locations") or []):
+            refs.append(
+                normalized_ref(
+                    ref_id=f"{source_id}:primary_locations:{index}",
+                    source_id=source_id,
+                    ref_type="place",
+                    label=location.get("label"),
+                    canonical_id=location.get("canonical_id"),
+                    description=location.get("role_or_relationship"),
+                    source_title=source_title,
+                    confidence=location.get("confidence"),
+                )
+            )
+        for index, topic in enumerate(briefing.get("topics") or []):
+            refs.append(
+                normalized_ref(
+                    ref_id=f"{source_id}:topics:{index}",
+                    source_id=source_id,
+                    ref_type="topic",
+                    label=topic,
+                    canonical_id=None,
+                    description=briefing.get("navigation_summary"),
+                    source_title=source_title,
+                    confidence=None,
+                )
+            )
+
+    for ref_type, refs_in_type in (
+        ("historical_event", event_refs),
+        ("document_event", document_event_refs),
+        ("routine_procedural", routine_refs),
+    ):
+        for ref in refs_in_type:
+            source_id = ref.get("source_id")
+            briefing = harmonized_by_source.get(source_id, {})
+            refs.append(
+                normalized_ref(
+                    ref_id=ref.get("source_event_ref_id"),
+                    source_id=source_id,
+                    ref_type=ref_type,
+                    label=ref.get("label"),
+                    canonical_id=ref.get("canonical_id"),
+                    description=ref.get("summary"),
+                    source_title=briefing.get("brief_title"),
+                    confidence=ref.get("confidence"),
+                    event_time=ref.get("event_time"),
+                    location_label=ref.get("location_label"),
+                    location_id=ref.get("location_id"),
+                    participant_labels=ref.get("participant_labels"),
+                    participant_person_ids=ref.get("participant_person_ids"),
+                    supporting_quote=ref.get("supporting_quote"),
+                    page_refs=ref.get("page_refs"),
+                    event_kind=ref.get("event_kind"),
+                    event_class=ref.get("event_class"),
+                )
+            )
+    return [ref for ref in refs if ref.get("ref_id") and ref.get("label")]
+
+
+def normalized_ref(
+    *,
+    ref_id: str | None,
+    source_id: str | None,
+    ref_type: str,
+    label: Any,
+    canonical_id: Any,
+    description: Any,
+    source_title: Any,
+    confidence: Any,
+    event_time: dict[str, Any] | None = None,
+    location_label: Any = None,
+    location_id: Any = None,
+    participant_labels: list[Any] | None = None,
+    participant_person_ids: list[Any] | None = None,
+    supporting_quote: Any = None,
+    page_refs: list[Any] | None = None,
+    event_kind: Any = None,
+    event_class: Any = None,
+) -> dict[str, Any]:
+    text_parts = [
+        clean_text(label),
+        clean_text(description),
+        clean_text(source_title),
+        clean_text(location_label),
+        " ".join(clean_text(item) for item in participant_labels or [] if clean_text(item)),
+        clean_text(supporting_quote),
+    ]
+    event_time = event_time or {}
+    ref = {
+        "ref_id": ref_id,
+        "source_id": source_id,
+        "ref_type": ref_type,
+        "label": clean_text(label),
+        "normalized_label": normalize_key(label),
+        "canonical_id": canonical_id,
+        "description": clean_text(description),
+        "source_title": clean_text(source_title),
+        "confidence": confidence,
+        "event_time": normalize_event_time(event_time) if event_time else {},
+        "location_label": clean_text(location_label),
+        "location_key": normalize_key(location_label),
+        "location_id": location_id,
+        "participant_labels": [clean_text(item) for item in participant_labels or [] if clean_text(item)],
+        "participant_person_ids": sorted(set(item for item in participant_person_ids or [] if item)),
+        "supporting_quote": shorten_quote(supporting_quote),
+        "page_refs": normalize_page_refs(page_refs or []),
+        "event_kind": clean_text(event_kind),
+        "event_class": clean_text(event_class),
+        "embedding_text": clean_text(" | ".join(part for part in text_parts if part)),
+    }
+    ref["embedding_text_hash"] = sha256_text(ref["embedding_text"])
+    ref["embedding_id"] = f"ref_{sha256_text(ref['ref_id'] + '|' + ref['embedding_text_hash'])[:16]}"
+    return ref
+
+
+def build_embedding_inputs(
+    *,
+    normalized_refs: list[dict[str, Any]],
+    people: list[dict[str, Any]],
+    locations: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    harmonized_by_source: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    inputs: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(kind: str, stable_id: str, text: str, source_ref_id: str | None = None) -> str | None:
+        text = clean_text(text)
+        if not text:
+            return None
+        text_hash = sha256_text(text)
+        embedding_id = f"emb_{sha256_text(f'{kind}|{stable_id}|{text_hash}')[:18]}"
+        if embedding_id in seen:
+            return embedding_id
+        seen.add(embedding_id)
+        inputs.append(
+            {
+                "embedding_id": embedding_id,
+                "kind": kind,
+                "stable_id": stable_id,
+                "source_ref_id": source_ref_id,
+                "text": text,
+                "text_sha256": text_hash,
+            }
+        )
+        return embedding_id
+
+    for ref in normalized_refs:
+        embedding_id = add(ref["ref_type"], ref["ref_id"], ref.get("embedding_text") or ref.get("label"), ref["ref_id"])
+        if embedding_id:
+            ref["embedding_id"] = embedding_id
+
+    for person in people:
+        labels = entity_labels(person, ("display_name", "alternate_names"))
+        text = " | ".join(
+            clean_text(part)
+            for part in [
+                "person",
+                ", ".join(labels),
+                person.get("role") or person.get("occupation"),
+                person.get("bio") or person.get("summary") or person.get("description"),
+                " ".join(person.get("source_labels") or []),
+            ]
+            if clean_text(part)
+        )
+        add("canonical_person", person.get("id") or sha256_text(text)[:12], text)
+
+    for location in locations:
+        text = " | ".join(
+            clean_text(part)
+            for part in [
+                "place",
+                location.get("name"),
+                location.get("address_1886"),
+                location.get("address_1887"),
+                location.get("modern_address"),
+                location.get("type") or location.get("location_type"),
+                location.get("summary") or location.get("description"),
+            ]
+            if clean_text(part)
+        )
+        add("canonical_place", location.get("id") or sha256_text(text)[:12], text)
+
+    for event in events:
+        text = " | ".join(
+            clean_text(part)
+            for part in [
+                "event",
+                event.get("title") or event.get("label"),
+                event_date_text(event.get("time") or event.get("event_time")),
+                event.get("location_label") or event.get("location_name") or event.get("location_id"),
+                ", ".join(event.get("participant_labels") or event.get("participant_person_ids") or []),
+                event.get("description") or event.get("summary"),
+            ]
+            if clean_text(part)
+        )
+        add("canonical_event", event.get("id") or sha256_text(text)[:12], text)
+
+    topic_examples: dict[str, list[str]] = {}
+    for briefing in harmonized_by_source.values():
+        for topic in briefing.get("topics") or []:
+            topic_examples.setdefault(topic, [])
+            if len(topic_examples[topic]) < 5:
+                topic_examples[topic].append(
+                    clean_text(f"{briefing.get('brief_title')} {briefing.get('navigation_summary')}")
+                )
+    for topic, examples in topic_examples.items():
+        add("topic_anchor", slugify(topic, "topic"), " | ".join(["topic", topic, *examples]))
+
+    return inputs
+
+
+def load_or_create_embeddings(
+    *,
+    storage: JsonStorage | None,
+    embedding_inputs: list[dict[str, Any]],
+    model: str,
+    dimensions: int,
+    enabled: bool,
+) -> tuple[dict[str, list[float]], dict[str, Any]]:
+    generated_at = datetime.now(timezone.utc).isoformat()
+    manifest: dict[str, Any] = {
+        "version": HARMONIZATION_VERSION,
+        "enabled": enabled,
+        "model": model,
+        "dimensions": dimensions,
+        "generated_at": generated_at,
+        "cache_hits": 0,
+        "created": 0,
+        "usage": zero_usage(),
+        "cost_usd": 0.0,
+        "items": [],
+    }
+    vectors_by_id: dict[str, list[float]] = {}
+    if not enabled:
+        return vectors_by_id, manifest
+    if storage is None:
+        raise RuntimeError("Brief harmonization embeddings require a storage backend for cache artifacts.")
+
+    missing: list[dict[str, Any]] = []
+    for item in embedding_inputs:
+        cache_key = embedding_cache_key(item, model, dimensions)
+        cache_path = embedding_cache_path(cache_key)
+        manifest_item = {
+            "embedding_id": item["embedding_id"],
+            "kind": item["kind"],
+            "stable_id": item["stable_id"],
+            "source_ref_id": item.get("source_ref_id"),
+            "text_sha256": item["text_sha256"],
+            "cache_key": cache_key,
+            "cache_path": cache_path,
+            "status": "missing",
+        }
+        if storage.exists(cache_path):
+            cached = storage.read_json(cache_path)
+            vectors_by_id[item["embedding_id"]] = cached.get("embedding") or []
+            manifest["cache_hits"] += 1
+            manifest_item["status"] = "hit"
+        else:
+            missing.append(item)
+        manifest["items"].append(manifest_item)
+
+    for batch in chunks(missing, 96):
+        vectors, raw_output, usage = call_openai_embeddings(
+            model=model,
+            inputs=[item["text"] for item in batch],
+            dimensions=dimensions,
+        )
+        if len(vectors) != len(batch):
+            raise RuntimeError(f"Embedding response count mismatch: expected {len(batch)}, received {len(vectors)}")
+        add_usage(manifest["usage"], usage)
+        manifest["cost_usd"] += estimate_cost_usd(model, usage)
+        for item, vector in zip(batch, vectors):
+            cache_key = embedding_cache_key(item, model, dimensions)
+            cache_path = embedding_cache_path(cache_key)
+            vectors_by_id[item["embedding_id"]] = vector
+            storage.write_json(
+                cache_path,
+                {
+                    "version": HARMONIZATION_VERSION,
+                    "model": model,
+                    "dimensions": dimensions,
+                    "input_text_hash": item["text_sha256"],
+                    "embedding_id": item["embedding_id"],
+                    "generated_at": generated_at,
+                    "usage": usage,
+                    "raw_model": (raw_output or {}).get("model"),
+                    "embedding": vector,
+                },
+            )
+            manifest["created"] += 1
+            for manifest_item in manifest["items"]:
+                if manifest_item["embedding_id"] == item["embedding_id"]:
+                    manifest_item["status"] = "created"
+                    break
+    manifest["cost_usd"] = round(manifest["cost_usd"], 8)
+    return vectors_by_id, manifest
+
+
+def build_candidate_matches(
+    normalized_refs: list[dict[str, Any]],
+    vectors_by_id: dict[str, list[float]],
+    embedding_inputs: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    refs_by_type: dict[str, list[dict[str, Any]]] = {}
+    for ref in normalized_refs:
+        refs_by_type.setdefault(candidate_group(ref["ref_type"]), []).append(ref)
+
+    matches: list[dict[str, Any]] = []
+    for group, refs in refs_by_type.items():
+        for left_index, left in enumerate(refs):
+            for right in refs[left_index + 1 :]:
+                if left.get("source_id") == right.get("source_id") and group != "event":
+                    continue
+                match = score_candidate_pair(left, right, group, vectors_by_id)
+                if match:
+                    matches.append(match)
+    for anchor in canonical_anchor_refs(embedding_inputs or []):
+        group = candidate_group(anchor["ref_type"])
+        for ref in refs_by_type.get(group, []):
+            match = score_candidate_pair(ref, anchor, group, vectors_by_id)
+            if match:
+                match["right_is_canonical_anchor"] = True
+                matches.append(match)
+    return sorted(matches, key=lambda item: (item["decision"], -float(item["overall_score"]), item["pair_id"]))
+
+
+def canonical_anchor_refs(embedding_inputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    kind_to_type = {
+        "canonical_person": "person",
+        "canonical_place": "place",
+        "canonical_event": "historical_event",
+        "topic_anchor": "topic",
+    }
+    for item in embedding_inputs:
+        ref_type = kind_to_type.get(item.get("kind"))
+        if not ref_type:
+            continue
+        text = clean_text(item.get("text"))
+        refs.append(
+            {
+                "ref_id": f"anchor:{item.get('stable_id')}",
+                "source_id": None,
+                "ref_type": ref_type,
+                "label": text[:160],
+                "normalized_label": normalize_key(text),
+                "canonical_id": item.get("stable_id") if item.get("kind", "").startswith("canonical_") else None,
+                "description": text,
+                "source_title": "canonical anchor",
+                "event_time": {},
+                "location_label": "",
+                "location_id": None,
+                "participant_labels": [],
+                "participant_person_ids": [],
+                "embedding_id": item.get("embedding_id"),
+            }
+        )
+    return refs
+
+
+def score_candidate_pair(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    group: str,
+    vectors_by_id: dict[str, list[float]],
+) -> dict[str, Any] | None:
+    left_label = left.get("normalized_label") or ""
+    right_label = right.get("normalized_label") or ""
+    if not left_label or not right_label:
+        return None
+    exact = left_label == right_label
+    char_score = SequenceMatcher(None, left_label, right_label).ratio()
+    token_score = token_overlap(left_label, right_label)
+    local_score = cosine_similarity(left_label, right_label)
+    embedding_score = vector_cosine(vectors_by_id.get(left.get("embedding_id")), vectors_by_id.get(right.get("embedding_id")))
+    semantic_score = embedding_score if embedding_score is not None else local_score
+    date_compatible = dates_compatible(left, right)
+    place_compatible = places_compatible(left, right)
+    participant_score = participant_overlap(left, right)
+    canonical_match = bool(left.get("canonical_id") and left.get("canonical_id") == right.get("canonical_id"))
+    context_ok = date_compatible and place_compatible
+    overall = max(char_score, token_score, local_score, semantic_score or 0.0)
+    if group == "event":
+        overall = max(overall, (semantic_score or 0.0) * 0.65 + participant_score * 0.2 + (0.15 if context_ok else 0.0))
+
+    high_impact = has_high_impact_anchor(left) or has_high_impact_anchor(right)
+    decision = "rejected"
+    if canonical_match:
+        decision = "accepted_auto"
+    elif exact and context_ok:
+        decision = "accepted_auto"
+    elif group == "event" and context_ok and (semantic_score or 0.0) >= 0.88 and participant_score >= 0.1:
+        decision = "accepted_auto"
+    elif group == "event" and context_ok and (semantic_score or 0.0) >= 0.78:
+        decision = "needs_llm_review"
+    elif group != "event" and context_ok and overall >= 0.92:
+        decision = "accepted_auto"
+    elif context_ok and overall >= 0.82:
+        decision = "needs_llm_review"
+    elif high_impact and overall >= 0.70:
+        decision = "needs_llm_review"
+
+    if decision == "rejected" and overall < 0.72:
+        return None
+    pair_id = pair_id_for(left["ref_id"], right["ref_id"])
+    return {
+        "pair_id": pair_id,
+        "group": group,
+        "left_ref_id": left["ref_id"],
+        "right_ref_id": right["ref_id"],
+        "left_label": left.get("label"),
+        "right_label": right.get("label"),
+        "left_type": left.get("ref_type"),
+        "right_type": right.get("ref_type"),
+        "scores": {
+            "exact_label": 1.0 if exact else 0.0,
+            "character_similarity": round(char_score, 4),
+            "token_overlap": round(token_score, 4),
+            "local_char_ngram_cosine": round(local_score, 4),
+            "embedding_cosine": round(embedding_score, 4) if embedding_score is not None else None,
+            "participant_overlap": round(participant_score, 4),
+        },
+        "overall_score": round(overall, 4),
+        "constraints": {
+            "date_compatible": date_compatible,
+            "place_compatible": place_compatible,
+            "canonical_match": canonical_match,
+            "high_impact_anchor": high_impact,
+        },
+        "decision": decision,
+    }
+
+
+def review_ambiguous_classifications(
+    *,
+    event_refs: list[dict[str, Any]],
+    document_event_refs: list[dict[str, Any]],
+    routine_refs: list[dict[str, Any]],
+    enabled: bool,
+    review_model: str,
+) -> list[dict[str, Any]]:
+    del routine_refs
+    candidates = [
+        ref
+        for ref in [*event_refs, *document_event_refs]
+        if ref.get("event_class") in {UNCERTAIN_CLASS, BOTH_CLASS}
+    ]
+    if not enabled or not candidates:
+        return []
+    batches: list[dict[str, Any]] = []
+    for index, ref_batch in enumerate(chunks(candidates, 32), start=1):
+        batch_id = f"classification_review_batch_{index:04d}"
+        llm_input = {
+            "batch_id": batch_id,
+            "instructions": (
+                "Classify each archival event reference as historical_event, document_event, both, "
+                "routine_procedural, or uncertain. Preserve routine procedural items in audit."
+            ),
+            "refs": [compact_ref_for_review(normalized_ref_for_classification(ref)) for ref in ref_batch],
+        }
+        record = {
+            "batch_id": batch_id,
+            "review_type": "event_classification",
+            "model": review_model,
+            "reasoning_effort": DEFAULT_REVIEW_REASONING_EFFORT,
+            "high_risk": False,
+            "input": llm_input,
+            "status": "pending",
+            "output": None,
+            "raw_output": None,
+            "usage": zero_usage(),
+            "cost_usd": 0.0,
+        }
+        try:
+            parsed, raw_output, usage = call_openai_structured(
+                model=review_model,
+                input_messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a cautious archival event classifier. "
+                            "Separate historical events from document lifecycle and routine court-procedure events."
+                        ),
+                    },
+                    {"role": "user", "content": json_dumps(llm_input)},
+                ],
+                schema=classification_review_schema(),
+                schema_name="brief_event_classification_review",
+                max_output_tokens=5000,
+                reasoning_effort=DEFAULT_REVIEW_REASONING_EFFORT,
+            )
+            record["status"] = "success"
+            record["output"] = parsed
+            record["raw_output"] = raw_output
+            record["usage"] = usage
+            record["cost_usd"] = round(estimate_cost_usd(review_model, usage), 8)
+        except Exception as exc:
+            record["status"] = "error"
+            record["error"] = str(exc)
+        batches.append(record)
+    return batches
+
+
+def normalized_ref_for_classification(ref: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ref_id": ref.get("source_event_ref_id"),
+        "ref_type": ref.get("event_class") or UNCERTAIN_CLASS,
+        "label": ref.get("label"),
+        "canonical_id": ref.get("canonical_id"),
+        "event_time": ref.get("event_time") or {},
+        "location_label": ref.get("location_label"),
+        "participant_labels": ref.get("participant_labels") or [],
+        "participant_person_ids": ref.get("participant_person_ids") or [],
+        "description": ref.get("summary"),
+        "supporting_quote": ref.get("supporting_quote"),
+        "source_title": ref.get("source_id"),
+    }
+
+
+def classification_review_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["decisions"],
+        "properties": {
+            "decisions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["ref_id", "event_class", "confidence", "rationale"],
+                    "properties": {
+                        "ref_id": {"type": "string"},
+                        "event_class": {
+                            "type": "string",
+                            "enum": [HISTORICAL_CLASS, DOCUMENT_CLASS, BOTH_CLASS, ROUTINE_CLASS, UNCERTAIN_CLASS],
+                        },
+                        "confidence": {"type": "number"},
+                        "rationale": {"type": "string"},
+                    },
+                },
+            }
+        },
+    }
+
+
+def apply_classification_reviews(
+    *,
+    harmonized_by_source: dict[str, dict[str, Any]],
+    event_refs: list[dict[str, Any]],
+    document_event_refs: list[dict[str, Any]],
+    routine_refs: list[dict[str, Any]],
+    review_batches: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    decisions: dict[str, str] = {}
+    for batch in review_batches:
+        if batch.get("review_type") != "event_classification" or batch.get("status") != "success":
+            continue
+        for decision in (batch.get("output") or {}).get("decisions") or []:
+            if float(decision.get("confidence") or 0.0) >= 0.6:
+                decisions[decision.get("ref_id")] = decision.get("event_class")
+    if not decisions:
+        return event_refs, document_event_refs, routine_refs
+
+    refs_by_id: dict[str, dict[str, Any]] = {}
+    for ref in [*event_refs, *document_event_refs, *routine_refs]:
+        ref_id = ref.get("source_event_ref_id")
+        if ref_id and ref_id not in refs_by_id:
+            refs_by_id[ref_id] = ref
+    new_event_refs: list[dict[str, Any]] = []
+    new_document_refs: list[dict[str, Any]] = []
+    new_routine_refs: list[dict[str, Any]] = []
+    for ref_id, ref in refs_by_id.items():
+        event_class = decisions.get(ref_id) or ref.get("event_class") or UNCERTAIN_CLASS
+        if event_class == ROUTINE_CLASS:
+            updated = {**ref, "event_class": ROUTINE_CLASS}
+            new_routine_refs.append(updated)
+        elif event_class == DOCUMENT_CLASS:
+            updated = {**ref, "event_class": DOCUMENT_CLASS, "event_kind": ref.get("event_kind") or infer_document_event_kind(ref)}
+            new_document_refs.append(updated)
+        elif event_class == BOTH_CLASS:
+            historical = {**ref, "event_class": BOTH_CLASS}
+            document = {**ref, "event_class": BOTH_CLASS, "event_kind": ref.get("event_kind") or infer_document_event_kind(ref)}
+            new_event_refs.append(historical)
+            new_document_refs.append(document)
+        else:
+            updated = {**ref, "event_class": event_class}
+            new_event_refs.append(updated)
+
+    for briefing in harmonized_by_source.values():
+        briefing["referenced_events"] = []
+        briefing["document_events"] = []
+        briefing["routine_procedural_events"] = []
+    for field, refs in (
+        ("referenced_events", new_event_refs),
+        ("document_events", new_document_refs),
+        ("routine_procedural_events", new_routine_refs),
+    ):
+        for ref in refs:
+            source_id = ref.get("source_id")
+            if source_id not in harmonized_by_source:
+                continue
+            clean_ref = {key: value for key, value in ref.items() if key != "source_id"}
+            harmonized_by_source[source_id].setdefault(field, []).append(clean_ref)
+    return new_event_refs, new_document_refs, new_routine_refs
+
+
+def review_ambiguous_candidates(
+    *,
+    candidate_matches: list[dict[str, Any]],
+    normalized_refs: list[dict[str, Any]],
+    enabled: bool,
+    review_model: str,
+    escalation_review_model: str,
+) -> list[dict[str, Any]]:
+    ambiguous = [match for match in candidate_matches if match.get("decision") == "needs_llm_review"]
+    if not enabled or not ambiguous:
+        return []
+
+    refs_by_id = {ref["ref_id"]: ref for ref in normalized_refs}
+    batches: list[dict[str, Any]] = []
+    for index, match_batch in enumerate(chunks(ambiguous, 24), start=1):
+        high_risk = any(is_high_risk_match(match) for match in match_batch)
+        model = escalation_review_model if high_risk else review_model
+        reasoning_effort = DEFAULT_ESCALATION_REASONING_EFFORT if high_risk else DEFAULT_REVIEW_REASONING_EFFORT
+        batch_id = f"review_batch_{index:04d}"
+        llm_input = {
+            "batch_id": batch_id,
+            "instructions": (
+                "Review only these candidate pairs. Decide whether each pair should merge, stay separate, "
+                "or be sent to human review. Do not invent new clusters."
+            ),
+            "candidates": [
+                {
+                    "pair_id": match["pair_id"],
+                    "scores": match["scores"],
+                    "constraints": match["constraints"],
+                    "left": compact_ref_for_review(refs_by_id.get(match["left_ref_id"], {})),
+                    "right": compact_ref_for_review(refs_by_id.get(match["right_ref_id"], {})),
+                }
+                for match in match_batch
+            ],
+        }
+        record = {
+            "batch_id": batch_id,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "high_risk": high_risk,
+            "input": llm_input,
+            "status": "pending",
+            "output": None,
+            "raw_output": None,
+            "usage": zero_usage(),
+            "cost_usd": 0.0,
+        }
+        try:
+            parsed, raw_output, usage = call_openai_structured(
+                model=model,
+                input_messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a cautious archival-data harmonization reviewer. "
+                            "Prefer keeping records separate when evidence conflicts."
+                        ),
+                    },
+                    {"role": "user", "content": json_dumps(llm_input)},
+                ],
+                schema=llm_review_schema(),
+                schema_name="brief_harmonization_review",
+                max_output_tokens=6000,
+                reasoning_effort=reasoning_effort,
+            )
+            record["status"] = "success"
+            record["output"] = parsed
+            record["raw_output"] = raw_output
+            record["usage"] = usage
+            record["cost_usd"] = round(estimate_cost_usd(model, usage), 8)
+        except Exception as exc:
+            record["status"] = "error"
+            record["error"] = str(exc)
+        batches.append(record)
+    return batches
+
+
+def llm_review_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["decisions"],
+        "properties": {
+            "decisions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["pair_id", "decision", "confidence", "rationale"],
+                    "properties": {
+                        "pair_id": {"type": "string"},
+                        "decision": {
+                            "type": "string",
+                            "enum": ["merge", "keep_separate", "needs_human_review"],
+                        },
+                        "confidence": {"type": "number"},
+                        "rationale": {"type": "string"},
+                    },
+                },
+            }
+        },
+    }
+
+
+def approved_match_pairs(candidate_matches: list[dict[str, Any]], llm_review_batches: list[dict[str, Any]]) -> set[frozenset[str]]:
+    approved: set[frozenset[str]] = set()
+    by_pair_id = {match["pair_id"]: match for match in candidate_matches}
+    for match in candidate_matches:
+        if match.get("decision") == "accepted_auto":
+            approved.add(frozenset((match["left_ref_id"], match["right_ref_id"])))
+    for batch in llm_review_batches:
+        output = batch.get("output") or {}
+        for decision in output.get("decisions") or []:
+            if decision.get("decision") != "merge":
+                continue
+            match = by_pair_id.get(decision.get("pair_id"))
+            if match:
+                approved.add(frozenset((match["left_ref_id"], match["right_ref_id"])))
+    return approved
+
+
+def build_qa_report(
+    *,
+    coverage: dict[str, Any],
+    candidate_matches: list[dict[str, Any]],
+    llm_review_batches: list[dict[str, Any]],
+    final_clusters: dict[str, Any],
+) -> dict[str, Any]:
+    cluster_ref_ids: list[str] = []
+    for cluster_group in ("event_clusters", "document_event_clusters"):
+        for cluster in final_clusters.get(cluster_group) or []:
+            cluster_ref_ids.extend(
+                support.get("source_event_ref_id")
+                for support in cluster.get("supporting_sources") or []
+                if support.get("source_event_ref_id")
+            )
+    cluster_ref_ids.extend(
+        ref.get("source_event_ref_id")
+        for ref in final_clusters.get("routine_procedural_refs") or []
+        if ref.get("source_event_ref_id")
+    )
+    duplicates = sorted(ref_id for ref_id, count in Counter(cluster_ref_ids).items() if count > 1)
+    return {
+        "version": HARMONIZATION_VERSION,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "coverage_ok": coverage.get("coverage_ok") is True and not duplicates,
+        "coverage": coverage,
+        "duplicate_final_ref_ids": duplicates,
+        "candidate_match_counts": dict(Counter(match.get("decision") for match in candidate_matches)),
+        "llm_review": {
+            "batches": len(llm_review_batches),
+            "successful_batches": sum(1 for batch in llm_review_batches if batch.get("status") == "success"),
+            "errored_batches": sum(1 for batch in llm_review_batches if batch.get("status") == "error"),
+            "cost_usd": round(sum(float(batch.get("cost_usd") or 0.0) for batch in llm_review_batches), 8),
+        },
+        "risky_merges": [
+            match
+            for match in candidate_matches
+            if match.get("decision") == "accepted_auto"
+            and match.get("constraints", {}).get("high_impact_anchor")
+            and float(match.get("overall_score") or 0.0) < 0.9
+        ][:50],
+        "over_split_anchor_candidates": [
+            match for match in candidate_matches if match.get("decision") == "needs_llm_review"
+        ][:50],
     }
 
 
@@ -546,11 +1477,18 @@ def infer_document_event_kind(ref: dict[str, Any]) -> str:
     return "other_document_event"
 
 
-def cluster_event_refs(refs: list[dict[str, Any]], prefix: str, *, is_document: bool) -> list[dict[str, Any]]:
+def cluster_event_refs(
+    refs: list[dict[str, Any]],
+    prefix: str,
+    *,
+    is_document: bool,
+    approved_pairs: set[frozenset[str]] | None = None,
+) -> list[dict[str, Any]]:
+    approved_pairs = approved_pairs or set()
     clusters: list[dict[str, Any]] = []
     for ref in refs:
         key = conservative_event_key(ref, is_document=is_document)
-        match = find_cluster(ref, key, clusters, is_document=is_document)
+        match = find_cluster(ref, key, clusters, is_document=is_document, approved_pairs=approved_pairs)
         if match is None:
             cluster_id = build_cluster_id(prefix, ref, len(clusters) + 1)
             match = {
@@ -606,12 +1544,21 @@ def find_cluster(
     clusters: list[dict[str, Any]],
     *,
     is_document: bool,
+    approved_pairs: set[frozenset[str]],
 ) -> dict[str, Any] | None:
     canonical_id = ref.get("canonical_id")
+    ref_id = ref.get("source_event_ref_id")
     date = ((ref.get("event_time") or {}).get("normalized_date") or "")[:10]
     location = normalize_key(ref.get("location_label"))
     label = normalize_key(ref.get("label"))
     for cluster in clusters:
+        if ref_id and any(
+            frozenset((ref_id, support.get("source_event_ref_id"))) in approved_pairs
+            for support in cluster.get("supporting_sources", [])
+            if support.get("source_event_ref_id")
+        ):
+            cluster["merge_method"] = "semantic_or_llm_approved_pair"
+            return cluster
         if canonical_id and cluster.get("canonical_id") == canonical_id:
             return cluster
         if cluster.get("merge_key") == key:
@@ -747,6 +1694,149 @@ def shorten_quote(value: Any, max_length: int = 220) -> str | None:
     if len(text) <= max_length:
         return text
     return text[: max_length - 1].rstrip() + "..."
+
+
+def sha256_text(value: Any) -> str:
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
+
+
+def embedding_cache_key(item: dict[str, Any], model: str, dimensions: int) -> str:
+    payload = "|".join(
+        [
+            HARMONIZATION_VERSION,
+            model,
+            str(dimensions),
+            item.get("kind") or "",
+            item.get("text_sha256") or "",
+        ]
+    )
+    return sha256_text(payload)
+
+
+def embedding_cache_path(cache_key: str) -> str:
+    return f"cache/haymarket/brief_harmonization_embeddings/{cache_key}.json"
+
+
+def zero_usage() -> dict[str, int]:
+    return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "reasoning_tokens": 0, "cached_input_tokens": 0}
+
+
+def add_usage(total: dict[str, int], usage: dict[str, int]) -> None:
+    for key in total:
+        total[key] += int((usage or {}).get(key) or 0)
+
+
+def chunks(values: list[Any], size: int) -> list[list[Any]]:
+    return [values[index : index + size] for index in range(0, len(values), size)]
+
+
+def event_date_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return clean_text(value)
+    return clean_text(
+        value.get("normalized_date")
+        or value.get("start")
+        or value.get("display")
+        or value.get("original_text")
+    )
+
+
+def candidate_group(ref_type: str) -> str:
+    if ref_type in {"historical_event", "document_event", "routine_procedural"}:
+        return "event"
+    if ref_type in {"place", "canonical_place"}:
+        return "place"
+    if ref_type in {"person", "canonical_person"}:
+        return "person"
+    return ref_type
+
+
+def vector_cosine(left: list[float] | None, right: list[float] | None) -> float | None:
+    if not left or not right or len(left) != len(right):
+        return None
+    dot = sum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(a * a for a in left))
+    right_norm = math.sqrt(sum(b * b for b in right))
+    if not left_norm or not right_norm:
+        return None
+    return dot / (left_norm * right_norm)
+
+
+def token_overlap(left: str, right: str) -> float:
+    left_tokens = set(normalize_key(left).split())
+    right_tokens = set(normalize_key(right).split())
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens.intersection(right_tokens)) / len(left_tokens.union(right_tokens))
+
+
+def dates_compatible(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    left_date = (((left.get("event_time") or {}).get("normalized_date") or "")[:10])
+    right_date = (((right.get("event_time") or {}).get("normalized_date") or "")[:10])
+    return not left_date or not right_date or left_date == right_date
+
+
+def places_compatible(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    left_id = left.get("location_id")
+    right_id = right.get("location_id")
+    if left_id and right_id:
+        return left_id == right_id
+    left_key = normalize_key(left.get("location_label"))
+    right_key = normalize_key(right.get("location_label"))
+    if not left_key or not right_key:
+        return True
+    return left_key == right_key or labels_are_near_duplicates(left_key, right_key)
+
+
+def participant_overlap(left: dict[str, Any], right: dict[str, Any]) -> float:
+    left_people = set(left.get("participant_person_ids") or [])
+    right_people = set(right.get("participant_person_ids") or [])
+    if left_people and right_people:
+        return len(left_people.intersection(right_people)) / len(left_people.union(right_people))
+    left_labels = {normalize_key(label) for label in left.get("participant_labels") or [] if normalize_key(label)}
+    right_labels = {normalize_key(label) for label in right.get("participant_labels") or [] if normalize_key(label)}
+    if left_labels and right_labels:
+        return len(left_labels.intersection(right_labels)) / len(left_labels.union(right_labels))
+    return 0.5 if not left_people and not right_people and not left_labels and not right_labels else 0.0
+
+
+def has_high_impact_anchor(ref: dict[str, Any]) -> bool:
+    text = normalize_key(" ".join(str(ref.get(key) or "") for key in ("label", "description", "source_title", "location_label")))
+    anchors = ("haymarket", "mccormick", "revenge", "arbeiter zeitung", "greif", "zepf", "bomb", "dynamite")
+    return any(anchor in text for anchor in anchors)
+
+
+def is_high_risk_match(match: dict[str, Any]) -> bool:
+    constraints = match.get("constraints") or {}
+    if constraints.get("high_impact_anchor"):
+        return True
+    if not constraints.get("date_compatible") or not constraints.get("place_compatible"):
+        return True
+    return float(match.get("overall_score") or 0.0) < 0.84
+
+
+def pair_id_for(left_ref_id: str, right_ref_id: str) -> str:
+    ordered = sorted([left_ref_id, right_ref_id])
+    return f"pair_{sha256_text('|'.join(ordered))[:16]}"
+
+
+def compact_ref_for_review(ref: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ref_id": ref.get("ref_id"),
+        "type": ref.get("ref_type"),
+        "label": ref.get("label"),
+        "canonical_id": ref.get("canonical_id"),
+        "date": (ref.get("event_time") or {}).get("normalized_date"),
+        "location": ref.get("location_label"),
+        "participants": ref.get("participant_labels") or ref.get("participant_person_ids") or [],
+        "summary": shorten_quote(ref.get("description"), max_length=260),
+        "quote": shorten_quote(ref.get("supporting_quote"), max_length=180),
+        "source_title": ref.get("source_title"),
+    }
+
+
+def json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def cosine_similarity(left: str, right: str) -> float:

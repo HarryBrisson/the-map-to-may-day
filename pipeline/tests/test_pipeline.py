@@ -10,6 +10,7 @@ for module_name in list(sys.modules):
         sys.modules.pop(module_name)
 
 from enrichment import geolocate_locations  # noqa: E402
+from enrichment import brief_harmonization  # noqa: E402
 from enrichment.brief_harmonization import harmonize_briefings  # noqa: E402
 from enrichment import stage_briefing  # noqa: E402
 from enrichment import stage_tagging  # noqa: E402
@@ -962,6 +963,155 @@ def test_brief_harmonization_clusters_near_duplicate_events() -> None:
 
     assert len(result["event_clusters"]) == 1
     assert result["event_clusters"][0]["support_count"] == 2
+
+
+def test_brief_harmonization_writes_embedding_artifacts_and_reuses_cache(tmp_path, monkeypatch) -> None:
+    storage = LocalJsonStorage(tmp_path)
+    pages = [{"id": "s1", "title": "S1", "source_type": "testimony", "transcript_metadata": {}}]
+    briefing = {
+        "source_id": "s1",
+        "summary": "",
+        "brief_title": "Haymarket testimony",
+        "navigation_summary": "Mentions the Haymarket meeting.",
+        "document_role": "testimony",
+        "topics": ["Haymarket"],
+        "primary_people": [{"label": "John Bonfield", "canonical_id": None, "role_or_relationship": "witness", "confidence": 0.9}],
+        "primary_locations": [{"label": "Haymarket Square", "canonical_id": None, "role_or_relationship": "place", "confidence": 0.9}],
+        "speaker_directory": [],
+        "referenced_events": [
+            {
+                "label": "Haymarket meeting and bombing",
+                "canonical_id": None,
+                "event_time": {"start": "1886-05-04", "precision": "day", "original_text": "May 4"},
+                "location_label": "Haymarket Square",
+                "location_id": None,
+                "participant_labels": ["John Bonfield"],
+                "participant_person_ids": [],
+                "summary": "The meeting ended with a bomb.",
+                "supporting_quote": "meeting and bombing",
+                "page_refs": ["p. 1"],
+                "confidence": 0.9,
+            }
+        ],
+        "document_events": [],
+    }
+    people = [{"id": "person_john_bonfield", "display_name": "John Bonfield", "alternate_names": []}]
+    locations = [{"id": "location_haymarket_square", "name": "Haymarket Square", "address_1886": "Randolph and Desplaines"}]
+    calls = {"count": 0}
+
+    def fake_embeddings(model, inputs, dimensions=None):
+        calls["count"] += 1
+        del model, dimensions
+        vectors = []
+        for text in inputs:
+            seed = sum(ord(char) for char in text)
+            vectors.append([float(seed % 7), float(seed % 11), 1.0])
+        return vectors, {"model": "fake-embedding"}, {"input_tokens": len(inputs), "output_tokens": 0, "total_tokens": len(inputs)}
+
+    monkeypatch.setattr(brief_harmonization, "call_openai_embeddings", fake_embeddings)
+    result = brief_harmonization.run_brief_harmonization(
+        storage=storage,
+        pages=pages,
+        briefings_by_source={"s1": briefing},
+        run_id="embed_test",
+        people=people,
+        locations=locations,
+        events=[],
+        use_embeddings=True,
+        embedding_model="text-embedding-3-small",
+        embedding_dimensions=512,
+    )
+
+    assert calls["count"] == 1
+    assert result["embedding_cache_manifest"]["created"] > 0
+    assert storage.exists("raw/haymarket/brief_harmonization/embed_test/normalized_refs.json")
+    assert storage.exists("raw/haymarket/brief_harmonization/embed_test/embedding_inputs.json")
+    assert storage.exists("raw/haymarket/brief_harmonization/embed_test/embedding_cache_manifest.json")
+    assert storage.exists("raw/haymarket/brief_harmonization/embed_test/candidate_matches.json")
+    assert storage.exists("raw/haymarket/brief_harmonization/embed_test/proposed_clusters.json")
+    assert storage.exists("raw/haymarket/brief_harmonization/embed_test/final_clusters.json")
+    assert storage.exists("raw/haymarket/brief_harmonization/embed_test/qa_report.json")
+
+    second = brief_harmonization.run_brief_harmonization(
+        storage=storage,
+        pages=pages,
+        briefings_by_source={"s1": briefing},
+        run_id="embed_test_second",
+        people=people,
+        locations=locations,
+        events=[],
+        use_embeddings=True,
+        embedding_model="text-embedding-3-small",
+        embedding_dimensions=512,
+    )
+    assert calls["count"] == 1
+    assert second["embedding_cache_manifest"]["cache_hits"] == result["embedding_cache_manifest"]["created"]
+
+
+def test_brief_harmonization_llm_reclassifies_uncertain_event(monkeypatch) -> None:
+    page = {"id": "s1", "title": "S1", "source_type": "testimony", "transcript_metadata": {}}
+    briefing = {
+        "source_id": "s1",
+        "summary": "",
+        "brief_title": "Ambiguous document",
+        "navigation_summary": "",
+        "document_role": "testimony",
+        "topics": [],
+        "primary_people": [],
+        "primary_locations": [],
+        "speaker_directory": [],
+        "referenced_events": [
+            {
+                "label": "Ambiguous archival reference",
+                "canonical_id": None,
+                "event_time": {"start": "1886-07-16", "precision": "day", "original_text": "July 16"},
+                "location_label": None,
+                "location_id": None,
+                "participant_labels": [],
+                "participant_person_ids": [],
+                "summary": "The paper was handled in the record.",
+                "supporting_quote": "handled in the record",
+                "page_refs": [],
+                "confidence": 0.6,
+            }
+        ],
+        "document_events": [],
+    }
+
+    def fake_structured(model, input_messages, schema, schema_name, max_output_tokens=None, reasoning_effort=None):
+        del model, input_messages, schema, max_output_tokens, reasoning_effort
+        assert schema_name == "brief_event_classification_review"
+        return (
+            {
+                "decisions": [
+                    {
+                        "ref_id": "s1:referenced_events:0",
+                        "event_class": "document_event",
+                        "confidence": 0.92,
+                        "rationale": "The reference describes document handling rather than a historical event.",
+                    }
+                ]
+            },
+            {"output": "structured"},
+            {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+        )
+
+    monkeypatch.setattr(brief_harmonization, "call_openai_structured", fake_structured)
+    result = harmonize_briefings(
+        pages=[page],
+        briefings_by_source={"s1": briefing},
+        run_id="classification_review",
+        people=[],
+        locations=[],
+        events=[],
+        use_llm_review=True,
+    )
+
+    harmonized = result["briefings_by_source"]["s1"]
+    assert harmonized["referenced_events"] == []
+    assert len(harmonized["document_events"]) == 1
+    assert harmonized["document_events"][0]["event_class"] == "document_event"
+    assert result["llm_review_batches"][0]["review_type"] == "event_classification"
 
 
 def test_run_brief_update_uses_durable_brief_cache_across_run_ids(tmp_path, monkeypatch) -> None:
