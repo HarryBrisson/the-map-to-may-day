@@ -20,6 +20,7 @@ from enrichment.brief_harmonization import (  # noqa: E402
     DEFAULT_EMBEDDING_DIMENSIONS,
     DEFAULT_EMBEDDING_MODEL,
     DEFAULT_ESCALATION_REVIEW_MODEL,
+    DEFAULT_MAX_LLM_REVIEW_BATCHES,
     DEFAULT_REVIEW_MODEL,
 )
 from enrichment.pipeline import run_brief_harmonization_update, run_brief_update, run_enrichment  # noqa: E402
@@ -248,12 +249,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--brief-harmonization-escalation-model",
         default=DEFAULT_ESCALATION_REVIEW_MODEL,
-        help="Structured-output model for high-risk Stage A.5 review batches.",
+        help=(
+            "Structured-output model for high-risk Stage A.5 review batches. "
+            "Default matches --brief-harmonization-review-model; pass gpt-5.5 explicitly "
+            "only when you want expensive escalation."
+        ),
     )
     parser.add_argument(
         "--no-brief-harmonization-llm-review",
         action="store_true",
         help="Skip LLM confirmation for ambiguous Stage A.5 candidate matches.",
+    )
+    parser.add_argument(
+        "--brief-harmonization-max-review-batches",
+        type=int,
+        default=DEFAULT_MAX_LLM_REVIEW_BATCHES,
+        help=(
+            "Maximum new Stage A.5 LLM review batches to run before stopping review work. "
+            "Completed batch artifacts are reused and do not count against the cap. "
+            "Use -1 for no cap. Default 4."
+        ),
     )
     parser.add_argument(
         "--clear-cache",
@@ -341,6 +356,12 @@ def main() -> None:
         and args.brief_harmonization_embedding_dimensions == DEFAULT_EMBEDDING_DIMENSIONS
     ):
         args.brief_harmonization_embedding_dimensions = 512
+    max_harmonization_review_batches = (
+        None
+        if args.brief_harmonization_max_review_batches is not None
+        and args.brief_harmonization_max_review_batches < 0
+        else args.brief_harmonization_max_review_batches
+    )
     if args.slate:
         slate_models = MODEL_SLATES[args.slate]
         if args.llm_model:
@@ -415,6 +436,7 @@ def main() -> None:
                 brief_harmonization_use_llm_review=not args.no_brief_harmonization_llm_review,
                 brief_harmonization_review_model=args.brief_harmonization_review_model,
                 brief_harmonization_escalation_model=args.brief_harmonization_escalation_model,
+                brief_harmonization_max_review_batches=max_harmonization_review_batches,
             )
             harmonization = result.get("harmonization") or {}
             coverage = harmonization.get("coverage") or {}
@@ -454,6 +476,7 @@ def main() -> None:
                 brief_harmonization_use_llm_review=not args.no_brief_harmonization_llm_review,
                 brief_harmonization_review_model=args.brief_harmonization_review_model,
                 brief_harmonization_escalation_model=args.brief_harmonization_escalation_model,
+                brief_harmonization_max_review_batches=max_harmonization_review_batches,
             )
             coverage = (result.get("harmonization") or {}).get("coverage") or {}
             print(
@@ -498,6 +521,7 @@ def main() -> None:
                 brief_harmonization_use_llm_review=not args.no_brief_harmonization_llm_review,
                 brief_harmonization_review_model=args.brief_harmonization_review_model,
                 brief_harmonization_escalation_model=args.brief_harmonization_escalation_model,
+                brief_harmonization_max_review_batches=max_harmonization_review_batches,
             )
             print(
                 "Enriched "

@@ -19,9 +19,10 @@ HARMONIZATION_VERSION = "brief_harmonization_v2"
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-large"
 DEFAULT_EMBEDDING_DIMENSIONS = 1024
 DEFAULT_REVIEW_MODEL = "gpt-5.4-mini"
-DEFAULT_ESCALATION_REVIEW_MODEL = "gpt-5.5"
+DEFAULT_ESCALATION_REVIEW_MODEL = DEFAULT_REVIEW_MODEL
 DEFAULT_REVIEW_REASONING_EFFORT = "low"
 DEFAULT_ESCALATION_REASONING_EFFORT = "medium"
+DEFAULT_MAX_LLM_REVIEW_BATCHES = 4
 HISTORICAL_CLASS = "historical_event"
 DOCUMENT_CLASS = "document_event"
 BOTH_CLASS = "both"
@@ -113,6 +114,8 @@ def run_brief_harmonization(
     use_llm_review: bool = False,
     review_model: str = DEFAULT_REVIEW_MODEL,
     escalation_review_model: str = DEFAULT_ESCALATION_REVIEW_MODEL,
+    max_llm_review_batches: int | None = DEFAULT_MAX_LLM_REVIEW_BATCHES,
+    progress: bool = True,
 ) -> dict[str, Any]:
     result = harmonize_briefings(
         storage=storage,
@@ -128,6 +131,8 @@ def run_brief_harmonization(
         use_llm_review=use_llm_review,
         review_model=review_model,
         escalation_review_model=escalation_review_model,
+        max_llm_review_batches=max_llm_review_batches,
+        progress=progress,
     )
     raw_prefix = f"raw/haymarket/brief_harmonization/{run_id}"
     storage.write_json("enriched/haymarket/brief_harmonization/latest.json", result["artifact"])
@@ -159,6 +164,8 @@ def harmonize_briefings(
     use_llm_review: bool = False,
     review_model: str = DEFAULT_REVIEW_MODEL,
     escalation_review_model: str = DEFAULT_ESCALATION_REVIEW_MODEL,
+    max_llm_review_batches: int | None = DEFAULT_MAX_LLM_REVIEW_BATCHES,
+    progress: bool = False,
 ) -> dict[str, Any]:
     people = people or []
     locations = locations or []
@@ -170,6 +177,9 @@ def harmonize_briefings(
     routine_refs: list[dict[str, Any]] = []
     classification_counts: Counter[str] = Counter()
 
+    report = progress_reporter(progress)
+    raw_prefix = f"raw/haymarket/brief_harmonization/{run_id}"
+    report(f"Brief harmonization: normalizing {len(briefings_by_source)} raw brief(s)")
     for source_id, raw_briefing in briefings_by_source.items():
         page = pages_by_id.get(source_id, {"id": source_id, "transcript_metadata": {}})
         harmonized = copy.deepcopy(raw_briefing or {})
@@ -235,12 +245,20 @@ def harmonize_briefings(
             routine_refs.append({**ref, "source_id": source_id})
             classification_counts[ROUTINE_CLASS] += 1
 
+    report(
+        "Brief harmonization: deterministic classification "
+        f"{len(event_refs)} historical/uncertain, {len(document_event_refs)} document, {len(routine_refs)} routine"
+    )
     classification_review_batches = review_ambiguous_classifications(
+        storage=storage,
+        raw_prefix=raw_prefix,
         event_refs=event_refs,
         document_event_refs=document_event_refs,
         routine_refs=routine_refs,
         enabled=use_llm_review,
         review_model=review_model,
+        max_new_batches=max_llm_review_batches,
+        report=report,
     )
     event_refs, document_event_refs, routine_refs = apply_classification_reviews(
         harmonized_by_source=harmonized_by_source,
@@ -263,6 +281,8 @@ def harmonize_briefings(
         document_event_refs=document_event_refs,
         routine_refs=routine_refs,
     )
+    write_intermediate_artifact(storage, raw_prefix, "normalized_refs.json", normalized_refs)
+    report(f"Brief harmonization: normalized {len(normalized_refs)} reference(s)")
     embedding_inputs = build_embedding_inputs(
         normalized_refs=normalized_refs,
         people=people,
@@ -270,20 +290,35 @@ def harmonize_briefings(
         events=events,
         harmonized_by_source=harmonized_by_source,
     )
+    write_intermediate_artifact(storage, raw_prefix, "embedding_inputs.json", embedding_inputs)
+    report(f"Brief harmonization: prepared {len(embedding_inputs)} embedding input(s)")
     vectors_by_id, embedding_cache_manifest = load_or_create_embeddings(
         storage=storage,
         embedding_inputs=embedding_inputs,
         model=embedding_model,
         dimensions=embedding_dimensions,
         enabled=use_embeddings,
+        report=report,
     )
-    candidate_matches = build_candidate_matches(normalized_refs, vectors_by_id, embedding_inputs)
+    write_intermediate_artifact(storage, raw_prefix, "embedding_cache_manifest.json", embedding_cache_manifest)
+    report("Brief harmonization: building candidate matches")
+    candidate_matches = build_candidate_matches(normalized_refs, vectors_by_id, embedding_inputs, report=report)
+    write_intermediate_artifact(storage, raw_prefix, "candidate_matches.json", candidate_matches)
+    report(
+        "Brief harmonization: built candidate matches "
+        f"{dict(Counter(match.get('decision') for match in candidate_matches))}"
+    )
+    remaining_review_cap = remaining_new_review_batches(max_llm_review_batches, classification_review_batches)
     llm_review_batches = classification_review_batches + review_ambiguous_candidates(
+        storage=storage,
+        raw_prefix=raw_prefix,
         candidate_matches=candidate_matches,
         normalized_refs=normalized_refs,
         enabled=use_llm_review,
         review_model=review_model,
         escalation_review_model=escalation_review_model,
+        max_new_batches=remaining_review_cap,
+        report=report,
     )
     approved_pairs = approved_match_pairs(candidate_matches, llm_review_batches)
 
@@ -298,11 +333,13 @@ def harmonize_briefings(
         "event_clusters": cluster_event_refs(event_refs, "brief_event", is_document=False),
         "document_event_clusters": cluster_event_refs(document_event_refs, "brief_document_event", is_document=True),
     }
+    write_intermediate_artifact(storage, raw_prefix, "proposed_clusters.json", proposed_clusters)
     final_clusters = {
         "event_clusters": event_clusters,
         "document_event_clusters": document_event_clusters,
         "routine_procedural_refs": routine_refs,
     }
+    write_intermediate_artifact(storage, raw_prefix, "final_clusters.json", final_clusters)
     assign_cluster_ids(harmonized_by_source, event_clusters, "referenced_events", "navigation_event_id")
     assign_cluster_ids(harmonized_by_source, document_event_clusters, "document_events", "navigation_document_event_id")
 
@@ -320,6 +357,7 @@ def harmonize_briefings(
         llm_review_batches=llm_review_batches,
         final_clusters=final_clusters,
     )
+    write_intermediate_artifact(storage, raw_prefix, "qa_report.json", qa_report)
     artifact = {
         "run_id": run_id,
         "version": HARMONIZATION_VERSION,
@@ -347,9 +385,16 @@ def harmonize_briefings(
                 "escalation_review_model": escalation_review_model,
                 "escalation_reasoning_effort": DEFAULT_ESCALATION_REASONING_EFFORT,
                 "batches": len(llm_review_batches),
+                "max_new_batches": max_llm_review_batches,
             },
         },
     }
+    write_intermediate_artifact(storage, raw_prefix, "audit.json", artifact)
+    report(
+        "Brief harmonization: complete "
+        f"{len(event_clusters)} event cluster(s), {len(document_event_clusters)} document-event cluster(s), "
+        f"coverage_ok={coverage.get('coverage_ok')}"
+    )
     return {
         "briefings_by_source": harmonized_by_source,
         "artifact": artifact,
@@ -447,6 +492,54 @@ def build_normalized_refs(
                 )
             )
     return [ref for ref in refs if ref.get("ref_id") and ref.get("label")]
+
+
+def progress_reporter(enabled: bool):
+    def report(message: str) -> None:
+        if enabled:
+            print(message, flush=True)
+
+    return report
+
+
+def write_intermediate_artifact(
+    storage: JsonStorage | None,
+    raw_prefix: str,
+    filename: str,
+    data: Any,
+) -> None:
+    if storage is None:
+        return
+    storage.write_json(f"{raw_prefix}/{filename}", data)
+
+
+def review_batch_path(raw_prefix: str, batch_id: str) -> str:
+    return f"{raw_prefix}/llm_review_batches/{batch_id}.json"
+
+
+def read_completed_review_batch(storage: JsonStorage | None, raw_prefix: str, batch_id: str) -> dict[str, Any] | None:
+    if storage is None:
+        return None
+    path = review_batch_path(raw_prefix, batch_id)
+    if not storage.exists(path):
+        return None
+    batch = storage.read_json(path)
+    if batch.get("status") == "success" and batch.get("output"):
+        return batch
+    return None
+
+
+def count_new_review_batches(review_batches: list[dict[str, Any]]) -> int:
+    return sum(1 for batch in review_batches if not batch.get("cache", {}).get("reused"))
+
+
+def remaining_new_review_batches(
+    max_new_batches: int | None,
+    completed_batches: list[dict[str, Any]],
+) -> int | None:
+    if max_new_batches is None or max_new_batches < 0:
+        return None
+    return max(0, max_new_batches - count_new_review_batches(completed_batches))
 
 
 def normalized_ref(
@@ -609,7 +702,9 @@ def load_or_create_embeddings(
     model: str,
     dimensions: int,
     enabled: bool,
+    report=None,
 ) -> tuple[dict[str, list[float]], dict[str, Any]]:
+    report = report or (lambda _message: None)
     generated_at = datetime.now(timezone.utc).isoformat()
     manifest: dict[str, Any] = {
         "version": HARMONIZATION_VERSION,
@@ -625,6 +720,7 @@ def load_or_create_embeddings(
     }
     vectors_by_id: dict[str, list[float]] = {}
     if not enabled:
+        report("Brief harmonization: embeddings disabled")
         return vectors_by_id, manifest
     if storage is None:
         raise RuntimeError("Brief harmonization embeddings require a storage backend for cache artifacts.")
@@ -652,7 +748,15 @@ def load_or_create_embeddings(
             missing.append(item)
         manifest["items"].append(manifest_item)
 
+    report(
+        "Brief harmonization: embedding cache "
+        f"{manifest['cache_hits']} hit(s), {len(missing)} missing "
+        f"({model}, dimensions={dimensions})"
+    )
     for batch in chunks(missing, 96):
+        batch_number = manifest["created"] // 96 + 1
+        total_batches = math.ceil(len(missing) / 96) if missing else 0
+        report(f"Brief harmonization: embedding batch {batch_number}/{total_batches} ({len(batch)} input(s))")
         vectors, raw_output, usage = call_openai_embeddings(
             model=model,
             inputs=[item["text"] for item in batch],
@@ -661,7 +765,8 @@ def load_or_create_embeddings(
         if len(vectors) != len(batch):
             raise RuntimeError(f"Embedding response count mismatch: expected {len(batch)}, received {len(vectors)}")
         add_usage(manifest["usage"], usage)
-        manifest["cost_usd"] += estimate_cost_usd(model, usage)
+        batch_cost = estimate_cost_usd(model, usage)
+        manifest["cost_usd"] += batch_cost
         for item, vector in zip(batch, vectors):
             cache_key = embedding_cache_key(item, model, dimensions)
             cache_path = embedding_cache_path(cache_key)
@@ -685,6 +790,10 @@ def load_or_create_embeddings(
                 if manifest_item["embedding_id"] == item["embedding_id"]:
                     manifest_item["status"] = "created"
                     break
+        report(
+            f"Brief harmonization: embedding batch {batch_number}/{total_batches} done "
+            f"cost=${batch_cost:.6f}"
+        )
     manifest["cost_usd"] = round(manifest["cost_usd"], 8)
     return vectors_by_id, manifest
 
@@ -693,28 +802,98 @@ def build_candidate_matches(
     normalized_refs: list[dict[str, Any]],
     vectors_by_id: dict[str, list[float]],
     embedding_inputs: list[dict[str, Any]] | None = None,
+    report=None,
 ) -> list[dict[str, Any]]:
+    report = report or (lambda _message: None)
     refs_by_type: dict[str, list[dict[str, Any]]] = {}
     for ref in normalized_refs:
         refs_by_type.setdefault(candidate_group(ref["ref_type"]), []).append(ref)
 
     matches: list[dict[str, Any]] = []
     for group, refs in refs_by_type.items():
+        pair_estimate = len(refs) * max(len(refs) - 1, 0) // 2
+        report(f"Brief harmonization: candidate group {group}: {len(refs)} ref(s), up to {pair_estimate} pair(s)")
+        considered = 0
+        scored = 0
         for left_index, left in enumerate(refs):
+            if left_index and left_index % 500 == 0:
+                report(
+                    f"Brief harmonization: candidate group {group}: "
+                    f"{left_index}/{len(refs)} refs scanned, {scored} candidate(s)"
+                )
             for right in refs[left_index + 1 :]:
                 if left.get("source_id") == right.get("source_id") and group != "event":
+                    continue
+                considered += 1
+                if not candidate_prefilter(left, right, group):
                     continue
                 match = score_candidate_pair(left, right, group, vectors_by_id)
                 if match:
                     matches.append(match)
+                    scored += 1
+        report(
+            f"Brief harmonization: candidate group {group}: "
+            f"{considered} pair(s) considered, {scored} candidate(s)"
+        )
     for anchor in canonical_anchor_refs(embedding_inputs or []):
         group = candidate_group(anchor["ref_type"])
+        anchor_scored = 0
         for ref in refs_by_type.get(group, []):
+            if not candidate_prefilter(ref, anchor, group):
+                continue
             match = score_candidate_pair(ref, anchor, group, vectors_by_id)
             if match:
                 match["right_is_canonical_anchor"] = True
                 matches.append(match)
+                anchor_scored += 1
+        if anchor_scored:
+            report(f"Brief harmonization: canonical anchor {anchor['ref_id']} produced {anchor_scored} candidate(s)")
     return sorted(matches, key=lambda item: (item["decision"], -float(item["overall_score"]), item["pair_id"]))
+
+
+def candidate_prefilter(left: dict[str, Any], right: dict[str, Any], group: str) -> bool:
+    if left.get("canonical_id") and left.get("canonical_id") == right.get("canonical_id"):
+        return True
+    left_label = left.get("normalized_label") or normalize_key(left.get("label"))
+    right_label = right.get("normalized_label") or normalize_key(right.get("label"))
+    if not left_label or not right_label:
+        return False
+    if left_label == right_label:
+        return True
+    left_tokens = significant_tokens(left_label)
+    right_tokens = significant_tokens(right_label)
+    shared = left_tokens.intersection(right_tokens)
+    if group == "event":
+        if not dates_compatible(left, right):
+            return False
+        if not shared and not (has_high_impact_anchor(left) and has_high_impact_anchor(right)):
+            return False
+        return True
+    if group in {"person", "place"}:
+        return bool(shared) or has_high_impact_anchor(left) or has_high_impact_anchor(right)
+    return bool(shared)
+
+
+def significant_tokens(value: str) -> set[str]:
+    stopwords = {
+        "a",
+        "an",
+        "and",
+        "by",
+        "for",
+        "in",
+        "of",
+        "on",
+        "or",
+        "the",
+        "to",
+        "with",
+        "source",
+        "testimony",
+        "document",
+        "event",
+    }
+    return {token for token in normalize_key(value).split() if len(token) > 2 and token not in stopwords}
 
 
 def canonical_anchor_refs(embedding_inputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -826,12 +1005,17 @@ def score_candidate_pair(
 
 def review_ambiguous_classifications(
     *,
+    storage: JsonStorage | None,
+    raw_prefix: str,
     event_refs: list[dict[str, Any]],
     document_event_refs: list[dict[str, Any]],
     routine_refs: list[dict[str, Any]],
     enabled: bool,
     review_model: str,
+    max_new_batches: int | None,
+    report=None,
 ) -> list[dict[str, Any]]:
+    report = report or (lambda _message: None)
     del routine_refs
     candidates = [
         ref
@@ -839,10 +1023,27 @@ def review_ambiguous_classifications(
         if ref.get("event_class") in {UNCERTAIN_CLASS, BOTH_CLASS}
     ]
     if not enabled or not candidates:
+        if candidates:
+            report(f"Brief harmonization: skipped {len(candidates)} ambiguous classification ref(s); LLM review disabled")
+        else:
+            report("Brief harmonization: no ambiguous classification refs for LLM review")
         return []
     batches: list[dict[str, Any]] = []
-    for index, ref_batch in enumerate(chunks(candidates, 32), start=1):
+    candidate_batches = chunks(candidates, 32)
+    report(
+        "Brief harmonization: classification LLM review "
+        f"{len(candidates)} ref(s), {len(candidate_batches)} batch(es), "
+        f"new-batch cap={max_new_batches if max_new_batches is not None and max_new_batches >= 0 else 'none'}"
+    )
+    new_batches_called = 0
+    for index, ref_batch in enumerate(candidate_batches, start=1):
         batch_id = f"classification_review_batch_{index:04d}"
+        cached = read_completed_review_batch(storage, raw_prefix, batch_id)
+        if cached:
+            cached["cache"] = {"reused": True}
+            report(f"Brief harmonization: classification batch {index}/{len(candidate_batches)} cache hit")
+            batches.append(cached)
+            continue
         llm_input = {
             "batch_id": batch_id,
             "instructions": (
@@ -864,6 +1065,16 @@ def review_ambiguous_classifications(
             "usage": zero_usage(),
             "cost_usd": 0.0,
         }
+        if max_new_batches is not None and max_new_batches >= 0 and new_batches_called >= max_new_batches:
+            record["status"] = "skipped_cap"
+            record["error"] = "LLM review batch cap reached; rerun with a higher cap to continue."
+            write_intermediate_artifact(storage, raw_prefix, f"llm_review_batches/{batch_id}.json", record)
+            report(f"Brief harmonization: classification batch {index}/{len(candidate_batches)} skipped by cap")
+            batches.append(record)
+            continue
+        write_intermediate_artifact(storage, raw_prefix, f"llm_review_batches/{batch_id}.json", record)
+        new_batches_called += 1
+        report(f"Brief harmonization: classification batch {index}/{len(candidate_batches)} starting ({review_model})")
         try:
             parsed, raw_output, usage = call_openai_structured(
                 model=review_model,
@@ -890,6 +1101,12 @@ def review_ambiguous_classifications(
         except Exception as exc:
             record["status"] = "error"
             record["error"] = str(exc)
+        write_intermediate_artifact(storage, raw_prefix, f"llm_review_batches/{batch_id}.json", record)
+        report(
+            "Brief harmonization: classification batch "
+            f"{index}/{len(candidate_batches)} {record['status']} "
+            f"cost=${float(record.get('cost_usd') or 0.0):.6f}"
+        )
         batches.append(record)
     return batches
 
@@ -1000,23 +1217,45 @@ def apply_classification_reviews(
 
 def review_ambiguous_candidates(
     *,
+    storage: JsonStorage | None,
+    raw_prefix: str,
     candidate_matches: list[dict[str, Any]],
     normalized_refs: list[dict[str, Any]],
     enabled: bool,
     review_model: str,
     escalation_review_model: str,
+    max_new_batches: int | None,
+    report=None,
 ) -> list[dict[str, Any]]:
+    report = report or (lambda _message: None)
     ambiguous = [match for match in candidate_matches if match.get("decision") == "needs_llm_review"]
     if not enabled or not ambiguous:
+        if ambiguous:
+            report(f"Brief harmonization: skipped {len(ambiguous)} ambiguous merge candidate(s); LLM review disabled")
+        else:
+            report("Brief harmonization: no ambiguous merge candidates for LLM review")
         return []
 
     refs_by_id = {ref["ref_id"]: ref for ref in normalized_refs}
     batches: list[dict[str, Any]] = []
-    for index, match_batch in enumerate(chunks(ambiguous, 24), start=1):
+    match_batches = chunks(ambiguous, 24)
+    report(
+        "Brief harmonization: merge LLM review "
+        f"{len(ambiguous)} candidate(s), {len(match_batches)} batch(es), "
+        f"new-batch cap={max_new_batches if max_new_batches is not None and max_new_batches >= 0 else 'none'}"
+    )
+    new_batches_called = 0
+    for index, match_batch in enumerate(match_batches, start=1):
         high_risk = any(is_high_risk_match(match) for match in match_batch)
         model = escalation_review_model if high_risk else review_model
         reasoning_effort = DEFAULT_ESCALATION_REASONING_EFFORT if high_risk else DEFAULT_REVIEW_REASONING_EFFORT
         batch_id = f"review_batch_{index:04d}"
+        cached = read_completed_review_batch(storage, raw_prefix, batch_id)
+        if cached:
+            cached["cache"] = {"reused": True}
+            report(f"Brief harmonization: merge batch {index}/{len(match_batches)} cache hit")
+            batches.append(cached)
+            continue
         llm_input = {
             "batch_id": batch_id,
             "instructions": (
@@ -1046,6 +1285,16 @@ def review_ambiguous_candidates(
             "usage": zero_usage(),
             "cost_usd": 0.0,
         }
+        if max_new_batches is not None and max_new_batches >= 0 and new_batches_called >= max_new_batches:
+            record["status"] = "skipped_cap"
+            record["error"] = "LLM review batch cap reached; rerun with a higher cap to continue."
+            write_intermediate_artifact(storage, raw_prefix, f"llm_review_batches/{batch_id}.json", record)
+            report(f"Brief harmonization: merge batch {index}/{len(match_batches)} skipped by cap")
+            batches.append(record)
+            continue
+        write_intermediate_artifact(storage, raw_prefix, f"llm_review_batches/{batch_id}.json", record)
+        new_batches_called += 1
+        report(f"Brief harmonization: merge batch {index}/{len(match_batches)} starting ({model})")
         try:
             parsed, raw_output, usage = call_openai_structured(
                 model=model,
@@ -1072,6 +1321,12 @@ def review_ambiguous_candidates(
         except Exception as exc:
             record["status"] = "error"
             record["error"] = str(exc)
+        write_intermediate_artifact(storage, raw_prefix, f"llm_review_batches/{batch_id}.json", record)
+        report(
+            "Brief harmonization: merge batch "
+            f"{index}/{len(match_batches)} {record['status']} "
+            f"cost=${float(record.get('cost_usd') or 0.0):.6f}"
+        )
         batches.append(record)
     return batches
 
@@ -1153,6 +1408,11 @@ def build_qa_report(
             "successful_batches": sum(1 for batch in llm_review_batches if batch.get("status") == "success"),
             "errored_batches": sum(1 for batch in llm_review_batches if batch.get("status") == "error"),
             "cost_usd": round(sum(float(batch.get("cost_usd") or 0.0) for batch in llm_review_batches), 8),
+        },
+        "qa_llm": {
+            "enabled": False,
+            "cost_usd": 0.0,
+            "note": "QA report is deterministic; LLM costs here are review-batch costs, not a separate QA call.",
         },
         "risky_merges": [
             match
