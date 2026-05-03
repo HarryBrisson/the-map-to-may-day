@@ -23,6 +23,7 @@ DEFAULT_ESCALATION_REVIEW_MODEL = DEFAULT_REVIEW_MODEL
 DEFAULT_REVIEW_REASONING_EFFORT = "low"
 DEFAULT_ESCALATION_REASONING_EFFORT = "medium"
 DEFAULT_MAX_LLM_REVIEW_BATCHES = 4
+DEFAULT_MAX_LLM_REVIEW_CANDIDATES = 240
 HISTORICAL_CLASS = "historical_event"
 DOCUMENT_CLASS = "document_event"
 BOTH_CLASS = "both"
@@ -115,6 +116,7 @@ def run_brief_harmonization(
     review_model: str = DEFAULT_REVIEW_MODEL,
     escalation_review_model: str = DEFAULT_ESCALATION_REVIEW_MODEL,
     max_llm_review_batches: int | None = DEFAULT_MAX_LLM_REVIEW_BATCHES,
+    max_llm_review_candidates: int | None = DEFAULT_MAX_LLM_REVIEW_CANDIDATES,
     progress: bool = True,
 ) -> dict[str, Any]:
     result = harmonize_briefings(
@@ -132,6 +134,7 @@ def run_brief_harmonization(
         review_model=review_model,
         escalation_review_model=escalation_review_model,
         max_llm_review_batches=max_llm_review_batches,
+        max_llm_review_candidates=max_llm_review_candidates,
         progress=progress,
     )
     raw_prefix = f"raw/haymarket/brief_harmonization/{run_id}"
@@ -165,6 +168,7 @@ def harmonize_briefings(
     review_model: str = DEFAULT_REVIEW_MODEL,
     escalation_review_model: str = DEFAULT_ESCALATION_REVIEW_MODEL,
     max_llm_review_batches: int | None = DEFAULT_MAX_LLM_REVIEW_BATCHES,
+    max_llm_review_candidates: int | None = DEFAULT_MAX_LLM_REVIEW_CANDIDATES,
     progress: bool = False,
 ) -> dict[str, Any]:
     people = people or []
@@ -318,6 +322,7 @@ def harmonize_briefings(
         review_model=review_model,
         escalation_review_model=escalation_review_model,
         max_new_batches=remaining_review_cap,
+        max_review_candidates=max_llm_review_candidates,
         report=report,
     )
     approved_pairs = approved_match_pairs(candidate_matches, llm_review_batches)
@@ -386,6 +391,7 @@ def harmonize_briefings(
                 "escalation_reasoning_effort": DEFAULT_ESCALATION_REASONING_EFFORT,
                 "batches": len(llm_review_batches),
                 "max_new_batches": max_llm_review_batches,
+                "max_review_candidates": max_llm_review_candidates,
             },
         },
     }
@@ -1225,13 +1231,38 @@ def review_ambiguous_candidates(
     review_model: str,
     escalation_review_model: str,
     max_new_batches: int | None,
+    max_review_candidates: int | None,
     report=None,
 ) -> list[dict[str, Any]]:
     report = report or (lambda _message: None)
-    ambiguous = [match for match in candidate_matches if match.get("decision") == "needs_llm_review"]
+    ambiguous_raw = [match for match in candidate_matches if match.get("decision") == "needs_llm_review"]
+    reviewable: list[dict[str, Any]] = []
+    skipped_nonreviewable = 0
+    for match in ambiguous_raw:
+        if llm_reviewable_match(match):
+            match["review_status"] = "candidate"
+            reviewable.append(match)
+        else:
+            match["review_status"] = "not_reviewed_nonreviewable_group"
+            skipped_nonreviewable += 1
+    reviewable.sort(key=llm_review_priority)
+    if max_review_candidates is not None and max_review_candidates >= 0:
+        ambiguous = reviewable[:max_review_candidates]
+        for match in ambiguous:
+            match["review_status"] = "selected_for_llm_review"
+        for match in reviewable[max_review_candidates:]:
+            match["review_status"] = "not_reviewed_candidate_cap"
+    else:
+        ambiguous = reviewable
+        for match in ambiguous:
+            match["review_status"] = "selected_for_llm_review"
     if not enabled or not ambiguous:
-        if ambiguous:
-            report(f"Brief harmonization: skipped {len(ambiguous)} ambiguous merge candidate(s); LLM review disabled")
+        if ambiguous_raw:
+            report(
+                "Brief harmonization: skipped merge LLM review "
+                f"({len(ambiguous_raw)} ambiguous candidate(s), {len(reviewable)} reviewable); "
+                "LLM review disabled"
+            )
         else:
             report("Brief harmonization: no ambiguous merge candidates for LLM review")
         return []
@@ -1241,8 +1272,11 @@ def review_ambiguous_candidates(
     match_batches = chunks(ambiguous, 24)
     report(
         "Brief harmonization: merge LLM review "
-        f"{len(ambiguous)} candidate(s), {len(match_batches)} batch(es), "
-        f"new-batch cap={max_new_batches if max_new_batches is not None and max_new_batches >= 0 else 'none'}"
+        f"{len(ambiguous_raw)} ambiguous candidate(s), {len(reviewable)} reviewable, "
+        f"{skipped_nonreviewable} skipped as non-reviewable, {len(ambiguous)} selected, "
+        f"{len(match_batches)} batch(es), "
+        f"new-batch cap={max_new_batches if max_new_batches is not None and max_new_batches >= 0 else 'none'}, "
+        f"candidate cap={max_review_candidates if max_review_candidates is not None and max_review_candidates >= 0 else 'none'}"
     )
     new_batches_called = 0
     for index, match_batch in enumerate(match_batches, start=1):
@@ -1403,6 +1437,7 @@ def build_qa_report(
         "coverage": coverage,
         "duplicate_final_ref_ids": duplicates,
         "candidate_match_counts": dict(Counter(match.get("decision") for match in candidate_matches)),
+        "candidate_review_status_counts": dict(Counter(match.get("review_status", "not_applicable") for match in candidate_matches)),
         "llm_review": {
             "batches": len(llm_review_batches),
             "successful_batches": sum(1 for batch in llm_review_batches if batch.get("status") == "success"),
@@ -2073,6 +2108,25 @@ def is_high_risk_match(match: dict[str, Any]) -> bool:
     if not constraints.get("date_compatible") or not constraints.get("place_compatible"):
         return True
     return float(match.get("overall_score") or 0.0) < 0.84
+
+
+def llm_reviewable_match(match: dict[str, Any]) -> bool:
+    if match.get("decision") != "needs_llm_review":
+        return False
+    group = match.get("group")
+    if group not in {"event", "person", "place"}:
+        return False
+    if match.get("right_is_canonical_anchor") and group != "event":
+        return False
+    return True
+
+
+def llm_review_priority(match: dict[str, Any]) -> tuple[int, int, float, str]:
+    group = match.get("group")
+    constraints = match.get("constraints") or {}
+    group_rank = 0 if group == "event" else 1
+    anchor_rank = 0 if constraints.get("high_impact_anchor") else 1
+    return (group_rank, anchor_rank, -float(match.get("overall_score") or 0.0), str(match.get("pair_id") or ""))
 
 
 def pair_id_for(left_ref_id: str, right_ref_id: str) -> str:

@@ -20,6 +20,7 @@ from enrichment.brief_harmonization import (  # noqa: E402
     DEFAULT_EMBEDDING_DIMENSIONS,
     DEFAULT_EMBEDDING_MODEL,
     DEFAULT_ESCALATION_REVIEW_MODEL,
+    DEFAULT_MAX_LLM_REVIEW_CANDIDATES,
     DEFAULT_MAX_LLM_REVIEW_BATCHES,
     DEFAULT_REVIEW_MODEL,
 )
@@ -271,6 +272,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--brief-harmonization-max-review-candidates",
+        type=int,
+        default=DEFAULT_MAX_LLM_REVIEW_CANDIDATES,
+        help=(
+            "Maximum ambiguous Stage A.5 merge candidates to send to LLM review after filtering. "
+            "Topic matches remain in candidate artifacts but are not reviewable by default. "
+            "Use -1 for no candidate cap. Default 240."
+        ),
+    )
+    parser.add_argument(
         "--clear-cache",
         action="store_true",
         help="Wipe durable Haymarket bundle and brief caches before running (separate from --clear-data).",
@@ -362,6 +373,12 @@ def main() -> None:
         and args.brief_harmonization_max_review_batches < 0
         else args.brief_harmonization_max_review_batches
     )
+    max_harmonization_review_candidates = (
+        None
+        if args.brief_harmonization_max_review_candidates is not None
+        and args.brief_harmonization_max_review_candidates < 0
+        else args.brief_harmonization_max_review_candidates
+    )
     if args.slate:
         slate_models = MODEL_SLATES[args.slate]
         if args.llm_model:
@@ -437,6 +454,7 @@ def main() -> None:
                 brief_harmonization_review_model=args.brief_harmonization_review_model,
                 brief_harmonization_escalation_model=args.brief_harmonization_escalation_model,
                 brief_harmonization_max_review_batches=max_harmonization_review_batches,
+                brief_harmonization_max_review_candidates=max_harmonization_review_candidates,
             )
             harmonization = result.get("harmonization") or {}
             coverage = harmonization.get("coverage") or {}
@@ -477,6 +495,7 @@ def main() -> None:
                 brief_harmonization_review_model=args.brief_harmonization_review_model,
                 brief_harmonization_escalation_model=args.brief_harmonization_escalation_model,
                 brief_harmonization_max_review_batches=max_harmonization_review_batches,
+                brief_harmonization_max_review_candidates=max_harmonization_review_candidates,
             )
             coverage = (result.get("harmonization") or {}).get("coverage") or {}
             print(
@@ -522,6 +541,7 @@ def main() -> None:
                 brief_harmonization_review_model=args.brief_harmonization_review_model,
                 brief_harmonization_escalation_model=args.brief_harmonization_escalation_model,
                 brief_harmonization_max_review_batches=max_harmonization_review_batches,
+                brief_harmonization_max_review_candidates=max_harmonization_review_candidates,
             )
             print(
                 "Enriched "

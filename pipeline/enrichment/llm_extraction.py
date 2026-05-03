@@ -7,6 +7,7 @@ from enrichment.brief_harmonization import (
     DEFAULT_EMBEDDING_DIMENSIONS,
     DEFAULT_EMBEDDING_MODEL,
     DEFAULT_ESCALATION_REVIEW_MODEL,
+    DEFAULT_MAX_LLM_REVIEW_CANDIDATES,
     DEFAULT_MAX_LLM_REVIEW_BATCHES,
     DEFAULT_REVIEW_MODEL,
     HARMONIZATION_VERSION,
@@ -54,6 +55,7 @@ def extract_pages_with_audit(
     brief_harmonization_review_model: str = DEFAULT_REVIEW_MODEL,
     brief_harmonization_escalation_model: str = DEFAULT_ESCALATION_REVIEW_MODEL,
     brief_harmonization_max_review_batches: int | None = DEFAULT_MAX_LLM_REVIEW_BATCHES,
+    brief_harmonization_max_review_candidates: int | None = DEFAULT_MAX_LLM_REVIEW_CANDIDATES,
 ) -> dict[str, Any]:
     if provider != "openai":
         raise ValueError(f"Unsupported LLM provider: {provider}")
@@ -81,7 +83,8 @@ def extract_pages_with_audit(
         f"review={brief_harmonization_use_llm_review}:"
         f"{brief_harmonization_review_model}:"
         f"{brief_harmonization_escalation_model}:"
-        f"cap={brief_harmonization_max_review_batches}"
+        f"batch_cap={brief_harmonization_max_review_batches}:"
+        f"candidate_cap={brief_harmonization_max_review_candidates}"
     )
     pages_needing_briefing: list[dict[str, Any]] = []
     page_cache_keys: dict[tuple[str, str], str] = {}
@@ -149,6 +152,7 @@ def extract_pages_with_audit(
             review_model=brief_harmonization_review_model,
             escalation_review_model=brief_harmonization_escalation_model,
             max_llm_review_batches=brief_harmonization_max_review_batches,
+            max_llm_review_candidates=brief_harmonization_max_review_candidates,
             progress=streaming,
         )
         briefings = harmonization["briefings_by_source"]
@@ -243,6 +247,7 @@ def extract_pages_with_audit(
                         "brief_harmonization_escalation_model": brief_harmonization_escalation_model,
                         "brief_harmonization_use_llm_review": brief_harmonization_use_llm_review,
                         "brief_harmonization_max_review_batches": brief_harmonization_max_review_batches,
+                        "brief_harmonization_max_review_candidates": brief_harmonization_max_review_candidates,
                         "transcription_model": model,
                         "transcription_format": transcription_format,
                         "tagging_model": tagging_model or model,

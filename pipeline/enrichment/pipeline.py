@@ -11,6 +11,7 @@ from enrichment.brief_harmonization import (
     DEFAULT_EMBEDDING_DIMENSIONS,
     DEFAULT_EMBEDDING_MODEL,
     DEFAULT_ESCALATION_REVIEW_MODEL,
+    DEFAULT_MAX_LLM_REVIEW_CANDIDATES,
     DEFAULT_MAX_LLM_REVIEW_BATCHES,
     DEFAULT_REVIEW_MODEL,
     run_brief_harmonization,
@@ -49,6 +50,7 @@ def run_enrichment(
     brief_harmonization_review_model: str = DEFAULT_REVIEW_MODEL,
     brief_harmonization_escalation_model: str = DEFAULT_ESCALATION_REVIEW_MODEL,
     brief_harmonization_max_review_batches: int | None = DEFAULT_MAX_LLM_REVIEW_BATCHES,
+    brief_harmonization_max_review_candidates: int | None = DEFAULT_MAX_LLM_REVIEW_CANDIDATES,
 ) -> dict[str, list[dict[str, Any]]]:
     pages = load_pages(storage, run_id)
     if page_filter:
@@ -79,6 +81,7 @@ def run_enrichment(
         brief_harmonization_review_model=brief_harmonization_review_model,
         brief_harmonization_escalation_model=brief_harmonization_escalation_model,
         brief_harmonization_max_review_batches=brief_harmonization_max_review_batches,
+        brief_harmonization_max_review_candidates=brief_harmonization_max_review_candidates,
     )
     failed_calls = [record for record in extraction["audit_records"] if record["status"] == "error"]
     successful_calls = [
@@ -188,6 +191,7 @@ def run_brief_update(
     brief_harmonization_review_model: str = DEFAULT_REVIEW_MODEL,
     brief_harmonization_escalation_model: str = DEFAULT_ESCALATION_REVIEW_MODEL,
     brief_harmonization_max_review_batches: int | None = DEFAULT_MAX_LLM_REVIEW_BATCHES,
+    brief_harmonization_max_review_candidates: int | None = DEFAULT_MAX_LLM_REVIEW_CANDIDATES,
 ) -> dict[str, Any]:
     pages = load_pages(storage, run_id)
     if page_filter:
@@ -316,6 +320,7 @@ def run_brief_update(
             review_model=brief_harmonization_review_model,
             escalation_review_model=brief_harmonization_escalation_model,
             max_llm_review_batches=brief_harmonization_max_review_batches,
+            max_llm_review_candidates=brief_harmonization_max_review_candidates,
             progress=streaming,
         )
         harmonized_briefings_by_source = harmonization_result["briefings_by_source"]
@@ -377,6 +382,7 @@ def run_brief_harmonization_update(
     brief_harmonization_review_model: str = DEFAULT_REVIEW_MODEL,
     brief_harmonization_escalation_model: str = DEFAULT_ESCALATION_REVIEW_MODEL,
     brief_harmonization_max_review_batches: int | None = DEFAULT_MAX_LLM_REVIEW_BATCHES,
+    brief_harmonization_max_review_candidates: int | None = DEFAULT_MAX_LLM_REVIEW_CANDIDATES,
 ) -> dict[str, Any]:
     pages = load_pages(storage, run_id)
     if page_filter:
@@ -406,6 +412,7 @@ def run_brief_harmonization_update(
         review_model=brief_harmonization_review_model,
         escalation_review_model=brief_harmonization_escalation_model,
         max_llm_review_batches=brief_harmonization_max_review_batches,
+        max_llm_review_candidates=brief_harmonization_max_review_candidates,
         progress=True,
     )
     harmonized_briefings_by_source = harmonization_result["briefings_by_source"]
