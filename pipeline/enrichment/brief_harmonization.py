@@ -334,9 +334,38 @@ def harmonize_briefings(
         is_document=True,
         approved_pairs=approved_pairs,
     )
+    proposed_event_clusters = copy.deepcopy(event_clusters)
+    proposed_document_event_clusters = copy.deepcopy(document_event_clusters)
+    refs_by_id = {ref["ref_id"]: ref for ref in normalized_refs}
+    event_cluster_second_pass = merge_aligned_event_clusters(
+        event_clusters,
+        vectors_by_id=vectors_by_id,
+        refs_by_id=refs_by_id,
+        is_document=False,
+    )
+    document_cluster_second_pass = merge_aligned_event_clusters(
+        document_event_clusters,
+        vectors_by_id=vectors_by_id,
+        refs_by_id=refs_by_id,
+        is_document=True,
+    )
+    report(
+        "Brief harmonization: second-pass cluster merges "
+        f"{event_cluster_second_pass['merged_clusters']} event cluster(s), "
+        f"{document_cluster_second_pass['merged_clusters']} document-event cluster(s)"
+    )
+    write_intermediate_artifact(
+        storage,
+        raw_prefix,
+        "cluster_second_pass_matches.json",
+        {
+            "event_clusters": event_cluster_second_pass,
+            "document_event_clusters": document_cluster_second_pass,
+        },
+    )
     proposed_clusters = {
-        "event_clusters": cluster_event_refs(event_refs, "brief_event", is_document=False),
-        "document_event_clusters": cluster_event_refs(document_event_refs, "brief_document_event", is_document=True),
+        "event_clusters": proposed_event_clusters,
+        "document_event_clusters": proposed_document_event_clusters,
     }
     write_intermediate_artifact(storage, raw_prefix, "proposed_clusters.json", proposed_clusters)
     final_clusters = {
@@ -900,6 +929,28 @@ def significant_tokens(value: str) -> set[str]:
         "event",
     }
     return {token for token in normalize_key(value).split() if len(token) > 2 and token not in stopwords}
+
+
+def distinctive_location_tokens(value: Any) -> set[str]:
+    generic = {
+        "ave",
+        "avenue",
+        "chicago",
+        "city",
+        "county",
+        "court",
+        "des",
+        "illinois",
+        "near",
+        "place",
+        "plaines",
+        "square",
+        "st",
+        "street",
+        "the",
+        "west",
+    }
+    return {token for token in significant_tokens(normalize_key(value)) if token not in generic}
 
 
 def canonical_anchor_refs(embedding_inputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1867,6 +1918,309 @@ def find_cluster(
             cluster["merge_method"] = "embedding_cosine_or_character_similarity"
             return cluster
     return None
+
+
+def merge_aligned_event_clusters(
+    clusters: list[dict[str, Any]],
+    *,
+    vectors_by_id: dict[str, list[float]],
+    refs_by_id: dict[str, dict[str, Any]],
+    is_document: bool,
+) -> dict[str, Any]:
+    if len(clusters) < 2:
+        return {"input_clusters": len(clusters), "output_clusters": len(clusters), "merged_clusters": 0, "matches": []}
+    profiles = {
+        cluster["id"]: cluster_similarity_profile(cluster, vectors_by_id=vectors_by_id, refs_by_id=refs_by_id)
+        for cluster in clusters
+    }
+    parent = {cluster["id"]: cluster["id"] for cluster in clusters}
+
+    def find(value: str) -> str:
+        while parent[value] != value:
+            parent[value] = parent[parent[value]]
+            value = parent[value]
+        return value
+
+    def union(left: str, right: str) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    matches: list[dict[str, Any]] = []
+    for left_index, left in enumerate(clusters):
+        for right in clusters[left_index + 1 :]:
+            decision = score_cluster_merge_candidate(
+                left,
+                right,
+                left_profile=profiles[left["id"]],
+                right_profile=profiles[right["id"]],
+                is_document=is_document,
+            )
+            if not decision["merge"]:
+                continue
+            union(left["id"], right["id"])
+            matches.append(decision)
+
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for cluster in clusters:
+        groups.setdefault(find(cluster["id"]), []).append(cluster)
+    merged = [merge_cluster_group(group) for group in groups.values()]
+    clusters[:] = sorted(merged, key=lambda item: (event_date_sort_key(item), normalize_key(item.get("label")), item.get("id") or ""))
+    return {
+        "input_clusters": len(parent),
+        "output_clusters": len(clusters),
+        "merged_clusters": len(parent) - len(clusters),
+        "matches": matches,
+    }
+
+
+def cluster_similarity_profile(
+    cluster: dict[str, Any],
+    *,
+    vectors_by_id: dict[str, list[float]],
+    refs_by_id: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    support_ref_ids = [
+        support.get("source_event_ref_id")
+        for support in cluster.get("supporting_sources") or []
+        if support.get("source_event_ref_id")
+    ]
+    vectors = [
+        vectors_by_id[refs_by_id[ref_id]["embedding_id"]]
+        for ref_id in support_ref_ids
+        if ref_id in refs_by_id
+        and refs_by_id[ref_id].get("embedding_id") in vectors_by_id
+    ]
+    return {
+        "text": cluster_identity_text(cluster),
+        "vector": average_vectors(vectors),
+        "location_tokens": distinctive_location_tokens(cluster.get("location_label")),
+        "label_tokens": significant_tokens(normalize_key(cluster.get("label"))),
+    }
+
+
+def cluster_identity_text(cluster: dict[str, Any]) -> str:
+    supports = []
+    for support in (cluster.get("supporting_sources") or [])[:24]:
+        supports.append(
+            {
+                "summary": shorten_quote(support.get("summary"), max_length=260),
+                "quote": shorten_quote(support.get("supporting_quote"), max_length=180),
+            }
+        )
+    payload = {
+        "label": cluster.get("label"),
+        "date": (cluster.get("event_time") or {}).get("normalized_date") or (cluster.get("event_time") or {}).get("start"),
+        "location": cluster.get("location_label"),
+        "participants": cluster.get("participant_labels") or cluster.get("participant_person_ids") or [],
+        "event_kind": cluster.get("event_kind"),
+        "event_class": cluster.get("event_class"),
+        "supports": supports,
+    }
+    return json_dumps(payload)
+
+
+def average_vectors(vectors: list[list[float]]) -> list[float] | None:
+    if not vectors:
+        return None
+    dimensions = len(vectors[0])
+    compatible = [vector for vector in vectors if len(vector) == dimensions]
+    if not compatible:
+        return None
+    return [sum(vector[index] for vector in compatible) / len(compatible) for index in range(dimensions)]
+
+
+def score_cluster_merge_candidate(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    *,
+    left_profile: dict[str, Any],
+    right_profile: dict[str, Any],
+    is_document: bool,
+) -> dict[str, Any]:
+    left_label = normalize_key(left.get("label"))
+    right_label = normalize_key(right.get("label"))
+    canonical_match = bool(left.get("canonical_id") and left.get("canonical_id") == right.get("canonical_id"))
+    date_compatible = dates_compatible(left, right)
+    exact_date_match = cluster_date_value(left) != "" and cluster_date_value(left) == cluster_date_value(right)
+    kind_compatible = (not is_document) or ((left.get("event_kind") or "") == (right.get("event_kind") or ""))
+    if not canonical_match and (not exact_date_match or not kind_compatible):
+        return {
+            "merge": False,
+            "left_cluster_id": left.get("id"),
+            "right_cluster_id": right.get("id"),
+            "left_label": left.get("label"),
+            "right_label": right.get("label"),
+            "reason": "",
+            "scores": {},
+            "constraints": {
+                "date_compatible": date_compatible,
+                "exact_date_match": exact_date_match,
+                "place_compatible": None,
+                "kind_compatible": kind_compatible,
+                "shared_historical_terms": [],
+                "distinctive_place_overlap": False,
+                "high_impact_anchor": False,
+            },
+        }
+    place_compatible = cluster_places_compatible(left, right, left_profile, right_profile)
+    if not canonical_match and not place_compatible:
+        return {
+            "merge": False,
+            "left_cluster_id": left.get("id"),
+            "right_cluster_id": right.get("id"),
+            "left_label": left.get("label"),
+            "right_label": right.get("label"),
+            "reason": "",
+            "scores": {},
+            "constraints": {
+                "date_compatible": date_compatible,
+                "exact_date_match": exact_date_match,
+                "place_compatible": place_compatible,
+                "kind_compatible": kind_compatible,
+                "shared_historical_terms": [],
+                "distinctive_place_overlap": False,
+                "high_impact_anchor": False,
+            },
+        }
+    label_score = max(
+        SequenceMatcher(None, left_label, right_label).ratio(),
+        cosine_similarity(left_label, right_label),
+        token_overlap(left_label, right_label),
+    )
+    full_text_score = cosine_similarity(left_profile["text"], right_profile["text"])
+    embedding_score = vector_cosine(left_profile.get("vector"), right_profile.get("vector"))
+    semantic_score = max(full_text_score, embedding_score or 0.0)
+    shared_terms = left_profile["label_tokens"].intersection(right_profile["label_tokens"]).intersection(HISTORICAL_TERMS)
+    distinctive_place_overlap = bool(left_profile["location_tokens"].intersection(right_profile["location_tokens"]))
+    high_impact = has_high_impact_anchor(left) and has_high_impact_anchor(right)
+    merge = False
+    reason = ""
+    if canonical_match:
+        merge = True
+        reason = "same canonical id"
+    elif exact_date_match and place_compatible and kind_compatible and labels_are_near_duplicates(left_label, right_label):
+        merge = True
+        reason = "same date/place/kind and near-duplicate labels"
+    elif (
+        exact_date_match
+        and place_compatible
+        and kind_compatible
+        and shared_terms
+        and (semantic_score >= (0.68 if not is_document else 0.78) or label_score >= 0.74)
+    ):
+        merge = True
+        reason = "same date/place/kind with aligned full-object semantics"
+    elif (
+        exact_date_match
+        and kind_compatible
+        and high_impact
+        and distinctive_place_overlap
+        and shared_terms
+        and semantic_score >= (0.64 if not is_document else 0.76)
+    ):
+        merge = True
+        reason = "high-impact same-date event with distinctive place and aligned semantics"
+    return {
+        "merge": merge,
+        "left_cluster_id": left.get("id"),
+        "right_cluster_id": right.get("id"),
+        "left_label": left.get("label"),
+        "right_label": right.get("label"),
+        "reason": reason,
+        "scores": {
+            "label_similarity": round(label_score, 4),
+            "full_object_similarity": round(full_text_score, 4),
+            "aggregate_embedding_cosine": round(embedding_score, 4) if embedding_score is not None else None,
+        },
+        "constraints": {
+            "date_compatible": date_compatible,
+            "exact_date_match": exact_date_match,
+            "place_compatible": place_compatible,
+            "kind_compatible": kind_compatible,
+            "shared_historical_terms": sorted(shared_terms),
+            "distinctive_place_overlap": distinctive_place_overlap,
+            "high_impact_anchor": high_impact,
+        },
+    }
+
+
+def merge_cluster_group(group: list[dict[str, Any]]) -> dict[str, Any]:
+    if len(group) == 1:
+        return group[0]
+    group = sorted(group, key=lambda item: (-int(item.get("support_count") or 0), len(str(item.get("label") or ""))))
+    merged = copy.deepcopy(group[0])
+    support_by_ref = {
+        support.get("source_event_ref_id"): support
+        for support in merged.get("supporting_sources") or []
+        if support.get("source_event_ref_id")
+    }
+    for cluster in group[1:]:
+        for support in cluster.get("supporting_sources") or []:
+            ref_id = support.get("source_event_ref_id")
+            if ref_id and ref_id in support_by_ref:
+                continue
+            merged.setdefault("supporting_sources", []).append(support)
+            if ref_id:
+                support_by_ref[ref_id] = support
+        for person_id in cluster.get("participant_person_ids") or []:
+            if person_id not in merged.setdefault("participant_person_ids", []):
+                merged["participant_person_ids"].append(person_id)
+        for label in cluster.get("participant_labels") or []:
+            if label not in merged.setdefault("participant_labels", []):
+                merged["participant_labels"].append(label)
+    merged["participant_person_ids"] = sorted(merged.get("participant_person_ids") or [])
+    merged["participant_labels"] = sorted(merged.get("participant_labels") or [])
+    merged["support_count"] = len(merged.get("supporting_sources") or [])
+    merged["merge_method"] = "cluster_second_pass_full_object_similarity"
+    merged["merged_cluster_ids"] = sorted(cluster.get("id") for cluster in group if cluster.get("id"))
+    merged["id"] = rebuild_cluster_id_from_merged(merged)
+    return merged
+
+
+def rebuild_cluster_id_from_merged(cluster: dict[str, Any]) -> str:
+    prefix = "brief_document_event" if cluster.get("event_kind") else "brief_event"
+    support_ids = sorted(
+        support.get("source_event_ref_id")
+        for support in cluster.get("supporting_sources") or []
+        if support.get("source_event_ref_id")
+    )
+    seed = "|".join([cluster.get("label") or "", *support_ids])
+    digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:8]
+    base = " ".join(
+        str(part)
+        for part in [
+            (cluster.get("event_time") or {}).get("normalized_date"),
+            cluster.get("label"),
+            cluster.get("location_label"),
+        ]
+        if part
+    )
+    return f"{slugify(normalize_key(base), prefix)}_{digest}"
+
+
+def event_date_sort_key(cluster: dict[str, Any]) -> str:
+    return (((cluster.get("event_time") or {}).get("normalized_date") or (cluster.get("event_time") or {}).get("start") or ""))
+
+
+def cluster_date_value(cluster: dict[str, Any]) -> str:
+    return str(((cluster.get("event_time") or {}).get("normalized_date") or (cluster.get("event_time") or {}).get("start") or ""))[:10]
+
+
+def cluster_places_compatible(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    left_profile: dict[str, Any],
+    right_profile: dict[str, Any],
+) -> bool:
+    if places_compatible(left, right):
+        return True
+    left_tokens = left_profile.get("location_tokens") or set()
+    right_tokens = right_profile.get("location_tokens") or set()
+    if not left_tokens or not right_tokens:
+        return True
+    return bool(left_tokens.intersection(right_tokens))
 
 
 def labels_are_near_duplicates(left: str, right: str) -> bool:
