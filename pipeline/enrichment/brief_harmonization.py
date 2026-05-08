@@ -2084,6 +2084,29 @@ def score_cluster_merge_candidate(
                 "high_impact_anchor": False,
             },
         }
+    role_compatible = cluster_event_roles_compatible(left, right)
+    participant_compatible = cluster_participants_compatible(left, right)
+    if not canonical_match and not role_compatible:
+        return {
+            "merge": False,
+            "left_cluster_id": left.get("id"),
+            "right_cluster_id": right.get("id"),
+            "left_label": left.get("label"),
+            "right_label": right.get("label"),
+            "reason": "",
+            "scores": {},
+            "constraints": {
+                "date_compatible": date_compatible,
+                "exact_date_match": exact_date_match,
+                "place_compatible": place_compatible,
+                "kind_compatible": kind_compatible,
+                "role_compatible": role_compatible,
+                "participant_compatible": participant_compatible,
+                "shared_historical_terms": [],
+                "distinctive_place_overlap": False,
+                "high_impact_anchor": False,
+            },
+        }
     label_score = max(
         SequenceMatcher(None, left_label, right_label).ratio(),
         cosine_similarity(left_label, right_label),
@@ -2107,6 +2130,7 @@ def score_cluster_merge_candidate(
         exact_date_match
         and place_compatible
         and kind_compatible
+        and role_compatible
         and shared_terms
         and (semantic_score >= (0.68 if not is_document else 0.78) or label_score >= 0.74)
     ):
@@ -2116,6 +2140,8 @@ def score_cluster_merge_candidate(
         exact_date_match
         and kind_compatible
         and high_impact
+        and role_compatible
+        and participant_compatible
         and distinctive_place_overlap
         and shared_terms
         and semantic_score >= (0.64 if not is_document else 0.76)
@@ -2139,6 +2165,8 @@ def score_cluster_merge_candidate(
             "exact_date_match": exact_date_match,
             "place_compatible": place_compatible,
             "kind_compatible": kind_compatible,
+            "role_compatible": role_compatible,
+            "participant_compatible": participant_compatible,
             "shared_historical_terms": sorted(shared_terms),
             "distinctive_place_overlap": distinctive_place_overlap,
             "high_impact_anchor": high_impact,
@@ -2221,6 +2249,121 @@ def cluster_places_compatible(
     if not left_tokens or not right_tokens:
         return True
     return bool(left_tokens.intersection(right_tokens))
+
+
+def cluster_event_roles_compatible(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    left_roles = cluster_event_roles(left)
+    right_roles = cluster_event_roles(right)
+    if left_roles.intersection(right_roles):
+        return True
+    lifecycle = {"notice", "publication", "distribution", "planning", "translation", "evidence"}
+    incident = {"bombing", "shooting", "riot", "wounding", "death"}
+    if (left_roles.intersection(lifecycle) and right_roles.intersection(incident)) or (
+        right_roles.intersection(lifecycle) and left_roles.intersection(incident)
+    ):
+        return False
+    if "office_meeting" in left_roles and not {"office_meeting", "planning"}.intersection(right_roles):
+        return False
+    if "office_meeting" in right_roles and not {"office_meeting", "planning"}.intersection(left_roles):
+        return False
+    return True
+
+
+def cluster_event_roles(cluster: dict[str, Any]) -> set[str]:
+    text = normalize_key(
+        " ".join(
+            str(part or "")
+            for part in [
+                cluster.get("label"),
+                cluster.get("event_kind"),
+                cluster.get("location_label"),
+                *[
+                    support.get("summary") or ""
+                    for support in (cluster.get("supporting_sources") or [])[:12]
+                ],
+            ]
+        )
+    )
+    roles: set[str] = set()
+    if any(term in text for term in ("notice", "advertis", "announcement", "call for", "called for", "calling")):
+        roles.add("notice")
+    if any(term in text for term in ("published", "publication", "newspaper", "article", "arbeiter zeitung", "alarm")):
+        roles.add("publication")
+    if any(term in text for term in ("circular", "handbill", "distributed", "distribution", "flier", "leaflet")):
+        roles.add("distribution")
+    if any(term in text for term in ("translated", "translation", "translator")):
+        roles.add("translation")
+    if any(term in text for term in ("telephone", "requested speaker", "requesting speakers", "organizing", "committee")):
+        roles.add("planning")
+    if any(term in text for term in ("office meeting", "arbeiter zeitung office", "107 fifth avenue", "american group meeting")):
+        roles.add("office_meeting")
+    if any(term in text for term in ("exhibit", "introduced into evidence", "trial record")):
+        roles.add("evidence")
+    if any(term in text for term in ("bomb", "explosion", "bombing", "bomb throwing", "bomb thrown")):
+        roles.add("bombing")
+    if any(term in text for term in ("shooting", "gunfire", "pistol", "revolver", "shots fired")):
+        roles.add("shooting")
+    if any(term in text for term in ("riot", "massacre", "affair")):
+        roles.add("riot")
+    if any(term in text for term in ("wounded", "wounding", "injured", "treatment of wounded")):
+        roles.add("wounding")
+    if any(term in text for term in ("killing", "death", "degan died", "fatal")):
+        roles.add("death")
+    if "meeting" in text or "rally" in text or "mass meeting" in text:
+        roles.add("meeting")
+    return roles or {"event"}
+
+
+def cluster_participants_compatible(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    left_specific = cluster_specific_participant_tokens(left)
+    right_specific = cluster_specific_participant_tokens(right)
+    if not left_specific or not right_specific:
+        return True
+    if left_specific.intersection(right_specific):
+        return True
+    left_roles = cluster_event_roles(left)
+    right_roles = cluster_event_roles(right)
+    if "meeting" in left_roles.intersection(right_roles) and (
+        has_high_impact_anchor(left) or has_high_impact_anchor(right)
+    ):
+        return True
+    return False
+
+
+def cluster_specific_participant_tokens(cluster: dict[str, Any]) -> set[str]:
+    generic = {
+        "attendees",
+        "audience",
+        "certain",
+        "charged",
+        "crowd",
+        "defendant",
+        "defendants",
+        "group",
+        "groups",
+        "jurors",
+        "meeting",
+        "members",
+        "officers",
+        "people",
+        "police",
+        "public",
+        "speakers",
+        "these",
+        "unidentified",
+        "unknown",
+        "workingmen",
+    }
+    tokens: set[str] = set()
+    for person_id in cluster.get("participant_person_ids") or []:
+        key = normalize_key(person_id).replace("person ", "")
+        if key and key not in generic:
+            tokens.add(key)
+    for label in cluster.get("participant_labels") or []:
+        parts = [token for token in significant_tokens(normalize_key(label)) if token not in generic]
+        if parts:
+            tokens.add(" ".join(parts))
+    return tokens
 
 
 def labels_are_near_duplicates(left: str, right: str) -> bool:
